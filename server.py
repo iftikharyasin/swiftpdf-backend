@@ -8,13 +8,11 @@ import shutil
 
 app = FastAPI(title="SwiftPDF High-Fidelity Converter API")
 
-# Allow your website to talk to this server
-# Allow your website to talk to this server
+# ✅ FIXED CORS: DeepSeek's correct middleware setup
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_origin_regex=".*",
-    allow_credentials=True,
+    allow_origins=["*"], 
+    allow_credentials=False, 
     allow_methods=["*"],
     allow_headers=["*"],
 )
