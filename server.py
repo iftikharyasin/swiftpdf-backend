@@ -8,11 +8,11 @@ import shutil
 
 app = FastAPI(title="SwiftPDF High-Fidelity Converter API")
 
-# ✅ FIXED CORS: DeepSeek's correct middleware setup
+# Allow your local HTML files to communicate with this server
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], 
-    allow_credentials=False, 
+    allow_origins=["*"],
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -28,7 +28,6 @@ async def convert_pdf(engine_name: str, file: UploadFile = File(...)):
         with open(in_pdf_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
 
-        # Convert PDF to Word exactly like iLovePDF
         cv = Converter(in_pdf_path)
         cv.convert(out_docx_path, start=0, end=None, multi_processing=True, cpu_count=4)
         cv.close()
