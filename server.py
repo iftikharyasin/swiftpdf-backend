@@ -8,7 +8,6 @@ import shutil
 
 app = FastAPI(title="SwiftPDF High-Fidelity Converter API")
 
-# Allow your local HTML files to communicate with this server
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -17,19 +16,22 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-@app.post("/api/convert/{engine_name}")
-async def convert_pdf(engine_name: str, file: UploadFile = File(...)):
+# ✅ Simplified endpoint (no engine_name needed)
+@app.post("/api/convert")
+async def convert_pdf(file: UploadFile = File(...)):
     temp_dir = tempfile.mkdtemp()
     in_pdf_path = os.path.join(temp_dir, file.filename or "input.pdf")
     base_name = os.path.splitext(file.filename or "converted")[0]
-    out_docx_path = os.path.join(temp_dir, f"{base_name}-{engine_name}.docx")
+    out_docx_path = os.path.join(temp_dir, f"{base_name}-converted.docx")
 
     try:
         with open(in_pdf_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
 
         cv = Converter(in_pdf_path)
-        cv.convert(out_docx_path, start=0, end=None, multi_processing=True, cpu_count=4)
+        # multi_processing=True can crash on Render's free tier (512MB RAM limit). 
+        # Use False for stability.
+        cv.convert(out_docx_path, start=0, end=None, multi_processing=False)
         cv.close()
 
         if not os.path.exists(out_docx_path) or os.path.getsize(out_docx_path) == 0:
