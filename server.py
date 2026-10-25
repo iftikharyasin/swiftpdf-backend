@@ -3,6 +3,7 @@ from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pdf2docx import Converter
 from pypdf import PdfReader, PdfWriter
+import fitz  # PyMuPDF engine for enterprise compression
 import tempfile
 import os
 import shutil
@@ -36,11 +37,9 @@ async def convert_pdf(background_tasks: BackgroundTasks, file: UploadFile = File
         with open(in_pdf_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
 
-        # ✅ Using pdf2docx for visual layout preservation
+        # Using pdf2docx for visual layout preservation
         cv = Converter(in_pdf_path)
         
-        # multi_processing=False prevents Render's 512MB RAM from crashing
-        # page_layout_analysis=True helps handle 2-column academic papers
         cv.convert(
             out_docx_path, 
             start=0, 
@@ -66,6 +65,48 @@ async def convert_pdf(background_tasks: BackgroundTasks, file: UploadFile = File
         traceback.print_exc()
         shutil.rmtree(temp_dir, ignore_errors=True)
         raise HTTPException(status_code=500, detail=f"Conversion failed: {str(e)}")
+
+
+@app.post("/api/compress")
+async def compress_pdf(background_tasks: BackgroundTasks, file: UploadFile = File(...), level: str = Form("medium")):
+    temp_dir = tempfile.mkdtemp()
+    safe_filename = file.filename or "document.pdf"
+    in_pdf_path = os.path.join(temp_dir, safe_filename)
+    out_pdf_path = os.path.join(temp_dir, f"compressed_{safe_filename}")
+
+    try:
+        with open(in_pdf_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+
+        # Open PDF with PyMuPDF's C-based engine
+        doc = fitz.open(in_pdf_path)
+        
+        # Dynamically apply compression algorithms based on user selection
+        if level == "extreme":
+            # Maximum garbage collection, deep stream compression, remove duplicate elements
+            doc.save(out_pdf_path, garbage=4, deflate=True, clean=True)
+        elif level == "medium":
+            # Standard garbage collection and deflation
+            doc.save(out_pdf_path, garbage=3, deflate=True, clean=True)
+        else:
+            # "Less" - Only remove obvious dead objects, keep maximum quality
+            doc.save(out_pdf_path, garbage=1, deflate=True, clean=False)
+            
+        doc.close()
+
+        background_tasks.add_task(cleanup_temp_dir, temp_dir)
+
+        return FileResponse(
+            out_pdf_path,
+            media_type="application/pdf",
+            filename=os.path.basename(out_pdf_path)
+        )
+    except Exception as e:
+        print("CRITICAL ERROR:")
+        traceback.print_exc()
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        raise HTTPException(status_code=500, detail=f"Compression failed: {str(e)}")
+
 
 @app.post("/api/protect")
 async def protect_pdf(background_tasks: BackgroundTasks, file: UploadFile = File(...), password: str = Form(...)):
