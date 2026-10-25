@@ -1,14 +1,11 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
-import pymupdf  # ✅ Using pymupdf, not fitz
-from docx import Document
-from docx.shared import Pt
+from pdf2docx import Converter
 import tempfile
 import os
 import shutil
 import traceback
-import re
 
 app = FastAPI(title="SwiftPDF High-Fidelity Converter API")
 
@@ -26,11 +23,6 @@ def cleanup_temp_dir(temp_dir: str):
     except Exception:
         pass
 
-# Cleans out illegal characters that cause Word to crash
-def clean_text(text):
-    text = re.sub(r'[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]', '', text)
-    return " ".join(text.split())
-
 @app.post("/api/convert")
 async def convert_pdf(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
     temp_dir = tempfile.mkdtemp()
@@ -43,39 +35,19 @@ async def convert_pdf(background_tasks: BackgroundTasks, file: UploadFile = File
         with open(in_pdf_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
 
-        doc = pymupdf.open(in_pdf_path)
-        docx = Document()
+        # ✅ Using pdf2docx for visual layout preservation
+        cv = Converter(in_pdf_path)
         
-        style = docx.styles['Normal']
-        style.font.name = 'Times New Roman'
-        style.font.size = Pt(11)
-
-        for page_num in range(len(doc)):
-            page = doc.load_page(page_num)
-            
-            # get_text("dict") is the most accurate way to extract text
-            text_dict = page.get_text("dict")
-            blocks = text_dict.get("blocks", [])
-            
-            # Sort blocks top-to-bottom, then left-to-right
-            blocks.sort(key=lambda b: (round(b.get("bbox", [0,0,0,0])[1] / 10), b.get("bbox", [0,0,0,0])[0]))
-            
-            for block in blocks:
-                if block.get("type") == 0: # 0 means text block
-                    for line in block.get("lines", []):
-                        line_text = ""
-                        for span in line.get("spans", []):
-                            line_text += span.get("text", "")
-                        
-                        cleaned = clean_text(line_text)
-                        if cleaned:
-                            docx.add_paragraph(cleaned)
-            
-            if page_num < len(doc) - 1:
-                docx.add_page_break()
-
-        docx.save(out_docx_path)
-        doc.close()
+        # multi_processing=False prevents Render's 512MB RAM from crashing
+        # page_layout_analysis=True helps handle 2-column academic papers
+        cv.convert(
+            out_docx_path, 
+            start=0, 
+            end=None, 
+            multi_processing=False, 
+            page_layout_analysis=True
+        )
+        cv.close()
 
         if not os.path.exists(out_docx_path) or os.path.getsize(out_docx_path) == 0:
             raise HTTPException(status_code=500, detail="Conversion produced an empty file.")
