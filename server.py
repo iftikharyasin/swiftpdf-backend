@@ -1,17 +1,15 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
-import pymupdf
-from docx import Document
-from docx.shared import Pt
+from pdf2docx import Converter
 import tempfile
 import os
 import shutil
-import traceback
-import re
+import uuid
 
 app = FastAPI(title="SwiftPDF High-Fidelity Converter API")
 
+# Allow local HTML files and your future domain to communicate with this server
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -21,68 +19,58 @@ app.add_middleware(
 )
 
 def cleanup_temp_dir(temp_dir: str):
+    """Safely delete the temporary directory after the file has been sent."""
     try:
         shutil.rmtree(temp_dir, ignore_errors=True)
-    except Exception:
-        pass
-
-def clean_text(text):
-    text = re.sub(r'[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]', '', text)
-    text = re.sub(r'\s+(?=[a-zA-Z])', ' ', text) 
-    return " ".join(text.split())
+    except Exception as e:
+        print(f"Error cleaning up {temp_dir}: {e}")
 
 @app.post("/api/convert")
 async def convert_pdf(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
+    # Create a unique temporary directory for this specific request
     temp_dir = tempfile.mkdtemp()
+    
+    # Clean the filename and ensure safe paths
     safe_filename = file.filename or "document.pdf"
     in_pdf_path = os.path.join(temp_dir, safe_filename)
     base_name = os.path.splitext(safe_filename)[0]
     out_docx_path = os.path.join(temp_dir, f"{base_name}-converted.docx")
 
     try:
+        # 1. Save the uploaded PDF to disk
         with open(in_pdf_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
 
-        doc = pymupdf.open(in_pdf_path)
-        docx = Document()
+        # 2. Convert using pdf2docx
+        cv = Converter(in_pdf_path)
         
-        style = docx.styles['Normal']
-        style.font.name = 'Times New Roman'
-        style.font.size = Pt(11)
+        # ✅ FIX: multi_processing=False prevents memory crashes on Render's free tier (512MB RAM)
+        # ✅ FIX: page_layout_analysis=True helps handle multi-column academic papers better
+        cv.convert(
+            out_docx_path, 
+            start=0, 
+            end=None, 
+            multi_processing=False, 
+            page_layout_analysis=True
+        )
+        cv.close()
 
-        for page_num in range(len(doc)):
-            page = doc.load_page(page_num)
-            
-            # Uses the lightweight C-extractor, not the heavy AI models
-            text = page.get_text("text")
-            
-            if text.strip():
-                cleaned_text = clean_text(text)
-                paragraphs = cleaned_text.split('\n\n')
-                for para in paragraphs:
-                    if para.strip():
-                        docx.add_paragraph(para.strip())
-
-            if page_num < len(doc) - 1:
-                docx.add_page_break()
-
-        docx.save(out_docx_path)
-        doc.close()
-
+        # 3. Verify the file was created successfully
         if not os.path.exists(out_docx_path) or os.path.getsize(out_docx_path) == 0:
             raise HTTPException(status_code=500, detail="Conversion produced an empty file.")
 
+        # 4. Add background task to delete the temp folder after the download finishes
         background_tasks.add_task(cleanup_temp_dir, temp_dir)
 
+        # 5. Return the DOCX file
         return FileResponse(
-            out_docx_path,
+            path=out_docx_path,
             media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
             filename=os.path.basename(out_docx_path)
         )
         
     except Exception as e:
-        print("CRITICAL ERROR:")
-        traceback.print_exc()
+        # If anything fails, clean up immediately
         shutil.rmtree(temp_dir, ignore_errors=True)
         raise HTTPException(status_code=500, detail=f"Conversion failed: {str(e)}")
 
