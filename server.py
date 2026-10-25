@@ -1,13 +1,14 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
-import pymupdf  # ✅ FIXED: Using modern 'pymupdf' instead of deprecated 'fitz'
+import pymupdf  # ✅ Using pymupdf, not fitz
 from docx import Document
 from docx.shared import Pt
 import tempfile
 import os
 import shutil
 import traceback
+import re
 
 app = FastAPI(title="SwiftPDF High-Fidelity Converter API")
 
@@ -25,6 +26,11 @@ def cleanup_temp_dir(temp_dir: str):
     except Exception:
         pass
 
+# Cleans out illegal characters that cause Word to crash
+def clean_text(text):
+    text = re.sub(r'[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]', '', text)
+    return " ".join(text.split())
+
 @app.post("/api/convert")
 async def convert_pdf(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
     temp_dir = tempfile.mkdtemp()
@@ -34,44 +40,40 @@ async def convert_pdf(background_tasks: BackgroundTasks, file: UploadFile = File
     out_docx_path = os.path.join(temp_dir, f"{base_name}-converted.docx")
 
     try:
-        # Save the uploaded PDF
         with open(in_pdf_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
 
-        # Open PDF with PyMuPDF
         doc = pymupdf.open(in_pdf_path)
-        
-        # Create a new Word Document
         docx = Document()
         
-        # Setup default font
         style = docx.styles['Normal']
         style.font.name = 'Times New Roman'
         style.font.size = Pt(11)
 
-        # Iterate through pages
         for page_num in range(len(doc)):
             page = doc.load_page(page_num)
             
-            # Extract text blocks
-            blocks = page.get_text("blocks")
+            # get_text("dict") is the most accurate way to extract text
+            text_dict = page.get_text("dict")
+            blocks = text_dict.get("blocks", [])
             
             # Sort blocks top-to-bottom, then left-to-right
-            blocks.sort(key=lambda b: (round(b[1] / 10), b[0])) 
+            blocks.sort(key=lambda b: (round(b.get("bbox", [0,0,0,0])[1] / 10), b.get("bbox", [0,0,0,0])[0]))
             
             for block in blocks:
-                # ✅ FIXED: block[6] == 0 ensures we only process text, not images
-                if block[6] == 0:
-                    text = block[4].strip()
-                    if text:
-                        cleaned_text = " ".join(text.split())
-                        docx.add_paragraph(cleaned_text)
+                if block.get("type") == 0: # 0 means text block
+                    for line in block.get("lines", []):
+                        line_text = ""
+                        for span in line.get("spans", []):
+                            line_text += span.get("text", "")
+                        
+                        cleaned = clean_text(line_text)
+                        if cleaned:
+                            docx.add_paragraph(cleaned)
             
-            # Add a page break after each page (except the last)
             if page_num < len(doc) - 1:
                 docx.add_page_break()
 
-        # Save the Word document
         docx.save(out_docx_path)
         doc.close()
 
@@ -87,7 +89,6 @@ async def convert_pdf(background_tasks: BackgroundTasks, file: UploadFile = File
         )
         
     except Exception as e:
-        # This prints the exact error to your Render logs if it fails again
         print("CRITICAL ERROR:")
         traceback.print_exc()
         shutil.rmtree(temp_dir, ignore_errors=True)
