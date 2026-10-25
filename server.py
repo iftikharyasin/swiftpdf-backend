@@ -141,7 +141,6 @@ async def protect_pdf(background_tasks: BackgroundTasks, file: UploadFile = File
 
         reader = PdfReader(in_pdf_path)
         
-        # --- NEW CHECK: Catch already-encrypted files immediately ---
         if reader.is_encrypted:
             raise ValueError("This file is already encrypted. Please unlock it first.")
         
@@ -188,7 +187,11 @@ async def unlock_pdf(background_tasks: BackgroundTasks, file: UploadFile = File(
         if not reader.is_encrypted:
             raise ValueError("This PDF is not password protected.")
 
-        if reader.decrypt(password) == 0:
+        try:
+            decrypt_status = reader.decrypt(password)
+            if decrypt_status == 0:
+                raise ValueError("Incorrect password.")
+        except Exception:
             raise ValueError("Incorrect password.")
 
         writer = PdfWriter()
