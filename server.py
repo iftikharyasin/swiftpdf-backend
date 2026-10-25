@@ -1,7 +1,7 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
-import pymupdf  # Using PyMuPDF
+import pymupdf
 from docx import Document
 from docx.shared import Pt
 import tempfile
@@ -26,11 +26,8 @@ def cleanup_temp_dir(temp_dir: str):
     except Exception:
         pass
 
-# Cleans illegal characters and fixes broken word spacing
 def clean_text(text):
-    # Remove weird control characters
     text = re.sub(r'[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]', '', text)
-    # Fix weird spacing like "p m e n t" back to "pment"
     text = re.sub(r'\s+(?=[a-zA-Z])', ' ', text) 
     return " ".join(text.split())
 
@@ -53,22 +50,19 @@ async def convert_pdf(background_tasks: BackgroundTasks, file: UploadFile = File
         style.font.name = 'Times New Roman'
         style.font.size = Pt(11)
 
-        # Process each page
         for page_num in range(len(doc)):
             page = doc.load_page(page_num)
             
-            # Extract text as a simple block (ignores complex layouts that cause blank pages)
+            # Uses the lightweight C-extractor, not the heavy AI models
             text = page.get_text("text")
             
             if text.strip():
                 cleaned_text = clean_text(text)
-                # Split by double newlines to keep paragraphs intact
                 paragraphs = cleaned_text.split('\n\n')
                 for para in paragraphs:
                     if para.strip():
                         docx.add_paragraph(para.strip())
 
-            # Add page break after each page to match the PDF structure
             if page_num < len(doc) - 1:
                 docx.add_page_break()
 
