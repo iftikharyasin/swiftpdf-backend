@@ -1,12 +1,13 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
-import fitz  # PyMuPDF
+import pymupdf  # ✅ FIXED: Using modern 'pymupdf' instead of deprecated 'fitz'
 from docx import Document
 from docx.shared import Pt
 import tempfile
 import os
 import shutil
+import traceback
 
 app = FastAPI(title="SwiftPDF High-Fidelity Converter API")
 
@@ -38,7 +39,7 @@ async def convert_pdf(background_tasks: BackgroundTasks, file: UploadFile = File
             shutil.copyfileobj(file.file, buffer)
 
         # Open PDF with PyMuPDF
-        doc = fitz.open(in_pdf_path)
+        doc = pymupdf.open(in_pdf_path)
         
         # Create a new Word Document
         docx = Document()
@@ -52,18 +53,19 @@ async def convert_pdf(background_tasks: BackgroundTasks, file: UploadFile = File
         for page_num in range(len(doc)):
             page = doc.load_page(page_num)
             
-            # Extract text blocks (PyMuPDF separates columns properly!)
+            # Extract text blocks
             blocks = page.get_text("blocks")
             
             # Sort blocks top-to-bottom, then left-to-right
             blocks.sort(key=lambda b: (round(b[1] / 10), b[0])) 
             
             for block in blocks:
-                text = block[4].strip()
-                if text:
-                    # Clean up internal newlines
-                    cleaned_text = " ".join(text.split())
-                    docx.add_paragraph(cleaned_text)
+                # ✅ FIXED: block[6] == 0 ensures we only process text, not images
+                if block[6] == 0:
+                    text = block[4].strip()
+                    if text:
+                        cleaned_text = " ".join(text.split())
+                        docx.add_paragraph(cleaned_text)
             
             # Add a page break after each page (except the last)
             if page_num < len(doc) - 1:
@@ -85,6 +87,9 @@ async def convert_pdf(background_tasks: BackgroundTasks, file: UploadFile = File
         )
         
     except Exception as e:
+        # This prints the exact error to your Render logs if it fails again
+        print("CRITICAL ERROR:")
+        traceback.print_exc()
         shutil.rmtree(temp_dir, ignore_errors=True)
         raise HTTPException(status_code=500, detail=f"Conversion failed: {str(e)}")
 
