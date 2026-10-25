@@ -65,6 +65,7 @@ async def convert_pdf(background_tasks: BackgroundTasks, file: UploadFile = File
         shutil.rmtree(temp_dir, ignore_errors=True)
         raise HTTPException(status_code=500, detail=f"Conversion failed: {str(e)}")
 
+
 @app.post("/api/compress")
 async def compress_pdf(background_tasks: BackgroundTasks, file: UploadFile = File(...), level: str = Form("medium")):
     temp_dir = tempfile.mkdtemp()
@@ -79,43 +80,37 @@ async def compress_pdf(background_tasks: BackgroundTasks, file: UploadFile = Fil
         # Apply specific image downsampling rules based on user choice
         if level == "extreme":
             img_quality = 20
-            scale_factor = 0.5  # Shrink image size by 50%
+            scale_factor = 0.5  
         elif level == "medium":
             img_quality = 40
-            scale_factor = 0.75 # Shrink image size by 25%
+            scale_factor = 0.75 
         else:
             img_quality = 70
-            scale_factor = 1.0  # Keep original image size
+            scale_factor = 1.0  
 
         writer = PdfWriter(clone_from=in_pdf_path)
 
-        # Loop through every page to find and compress large images
         for page in writer.pages:
             for img in page.images:
                 try:
                     pil_img = img.image
                     
-                    # Convert to RGB to prevent transparency/alpha channel crashes
                     if pil_img.mode in ("RGBA", "P", "CMYK"):
                         pil_img = pil_img.convert("RGB")
 
-                    # Downsample (Resize) the image to save massive amounts of space
                     if scale_factor < 1.0:
                         width, height = pil_img.size
                         new_size = (int(width * scale_factor), int(height * scale_factor))
                         pil_img = pil_img.resize(new_size, Image.Resampling.LANCZOS)
                     
-                    # Replace the heavy image with our new, tiny JPEG version
                     img.replace(pil_img, quality=img_quality)
                 except Exception as img_err:
                     print(f"Skipping image compression: {img_err}")
-                    pass # Ignore vector masks or unsupported graphics
+                    pass 
 
         with open(out_pdf_path, "wb") as f:
             writer.write(f)
 
-        # Failsafe: If the PDF was already heavily compressed and our tool made it bigger, 
-        # we return the original file so the user never gets a worse result.
         if os.path.getsize(out_pdf_path) >= os.path.getsize(in_pdf_path):
             shutil.copy(in_pdf_path, out_pdf_path)
 
@@ -132,6 +127,7 @@ async def compress_pdf(background_tasks: BackgroundTasks, file: UploadFile = Fil
         shutil.rmtree(temp_dir, ignore_errors=True)
         raise HTTPException(status_code=500, detail=f"Compression failed: {str(e)}")
 
+
 @app.post("/api/protect")
 async def protect_pdf(background_tasks: BackgroundTasks, file: UploadFile = File(...), password: str = Form(...)):
     temp_dir = tempfile.mkdtemp()
@@ -144,6 +140,11 @@ async def protect_pdf(background_tasks: BackgroundTasks, file: UploadFile = File
             shutil.copyfileobj(file.file, buffer)
 
         reader = PdfReader(in_pdf_path)
+        
+        # --- NEW CHECK: Catch already-encrypted files immediately ---
+        if reader.is_encrypted:
+            raise ValueError("This file is already encrypted. Please unlock it first.")
+        
         writer = PdfWriter()
 
         for page in reader.pages:
@@ -161,11 +162,15 @@ async def protect_pdf(background_tasks: BackgroundTasks, file: UploadFile = File
             media_type="application/pdf",
             filename=os.path.basename(out_pdf_path)
         )
+    except ValueError as ve:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        raise HTTPException(status_code=400, detail=str(ve))
     except Exception as e:
         print("CRITICAL ERROR:")
         traceback.print_exc()
         shutil.rmtree(temp_dir, ignore_errors=True)
         raise HTTPException(status_code=500, detail=f"Protection failed: {str(e)}")
+
 
 @app.post("/api/unlock")
 async def unlock_pdf(background_tasks: BackgroundTasks, file: UploadFile = File(...), password: str = Form(...)):
