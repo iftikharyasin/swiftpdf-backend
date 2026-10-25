@@ -3,7 +3,7 @@ from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pdf2docx import Converter
 from pypdf import PdfReader, PdfWriter
-import fitz  # PyMuPDF engine for enterprise compression
+from PIL import Image
 import tempfile
 import os
 import shutil
@@ -37,7 +37,6 @@ async def convert_pdf(background_tasks: BackgroundTasks, file: UploadFile = File
         with open(in_pdf_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
 
-        # Using pdf2docx for visual layout preservation
         cv = Converter(in_pdf_path)
         
         cv.convert(
@@ -66,7 +65,6 @@ async def convert_pdf(background_tasks: BackgroundTasks, file: UploadFile = File
         shutil.rmtree(temp_dir, ignore_errors=True)
         raise HTTPException(status_code=500, detail=f"Conversion failed: {str(e)}")
 
-
 @app.post("/api/compress")
 async def compress_pdf(background_tasks: BackgroundTasks, file: UploadFile = File(...), level: str = Form("medium")):
     temp_dir = tempfile.mkdtemp()
@@ -78,21 +76,48 @@ async def compress_pdf(background_tasks: BackgroundTasks, file: UploadFile = Fil
         with open(in_pdf_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
 
-        # Open PDF with PyMuPDF's C-based engine
-        doc = fitz.open(in_pdf_path)
-        
-        # Dynamically apply compression algorithms based on user selection
+        # Apply specific image downsampling rules based on user choice
         if level == "extreme":
-            # Maximum garbage collection, deep stream compression, remove duplicate elements
-            doc.save(out_pdf_path, garbage=4, deflate=True, clean=True)
+            img_quality = 20
+            scale_factor = 0.5  # Shrink image size by 50%
         elif level == "medium":
-            # Standard garbage collection and deflation
-            doc.save(out_pdf_path, garbage=3, deflate=True, clean=True)
+            img_quality = 40
+            scale_factor = 0.75 # Shrink image size by 25%
         else:
-            # "Less" - Only remove obvious dead objects, keep maximum quality
-            doc.save(out_pdf_path, garbage=1, deflate=True, clean=False)
-            
-        doc.close()
+            img_quality = 70
+            scale_factor = 1.0  # Keep original image size
+
+        writer = PdfWriter(clone_from=in_pdf_path)
+
+        # Loop through every page to find and compress large images
+        for page in writer.pages:
+            for img in page.images:
+                try:
+                    pil_img = img.image
+                    
+                    # Convert to RGB to prevent transparency/alpha channel crashes
+                    if pil_img.mode in ("RGBA", "P", "CMYK"):
+                        pil_img = pil_img.convert("RGB")
+
+                    # Downsample (Resize) the image to save massive amounts of space
+                    if scale_factor < 1.0:
+                        width, height = pil_img.size
+                        new_size = (int(width * scale_factor), int(height * scale_factor))
+                        pil_img = pil_img.resize(new_size, Image.Resampling.LANCZOS)
+                    
+                    # Replace the heavy image with our new, tiny JPEG version
+                    img.replace(pil_img, quality=img_quality)
+                except Exception as img_err:
+                    print(f"Skipping image compression: {img_err}")
+                    pass # Ignore vector masks or unsupported graphics
+
+        with open(out_pdf_path, "wb") as f:
+            writer.write(f)
+
+        # Failsafe: If the PDF was already heavily compressed and our tool made it bigger, 
+        # we return the original file so the user never gets a worse result.
+        if os.path.getsize(out_pdf_path) >= os.path.getsize(in_pdf_path):
+            shutil.copy(in_pdf_path, out_pdf_path)
 
         background_tasks.add_task(cleanup_temp_dir, temp_dir)
 
@@ -107,7 +132,6 @@ async def compress_pdf(background_tasks: BackgroundTasks, file: UploadFile = Fil
         shutil.rmtree(temp_dir, ignore_errors=True)
         raise HTTPException(status_code=500, detail=f"Compression failed: {str(e)}")
 
-
 @app.post("/api/protect")
 async def protect_pdf(background_tasks: BackgroundTasks, file: UploadFile = File(...), password: str = Form(...)):
     temp_dir = tempfile.mkdtemp()
@@ -119,7 +143,6 @@ async def protect_pdf(background_tasks: BackgroundTasks, file: UploadFile = File
         with open(in_pdf_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
 
-        # Encrypt the PDF with the provided password using 256-bit AES
         reader = PdfReader(in_pdf_path)
         writer = PdfWriter()
 
