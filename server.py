@@ -167,6 +167,48 @@ async def protect_pdf(background_tasks: BackgroundTasks, file: UploadFile = File
         shutil.rmtree(temp_dir, ignore_errors=True)
         raise HTTPException(status_code=500, detail=f"Protection failed: {str(e)}")
 
+@app.post("/api/unlock")
+async def unlock_pdf(background_tasks: BackgroundTasks, file: UploadFile = File(...), password: str = Form(...)):
+    temp_dir = tempfile.mkdtemp()
+    safe_filename = file.filename or "document.pdf"
+    in_pdf_path = os.path.join(temp_dir, safe_filename)
+    out_pdf_path = os.path.join(temp_dir, f"unlocked_{safe_filename}")
+
+    try:
+        with open(in_pdf_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+
+        reader = PdfReader(in_pdf_path)
+        
+        if not reader.is_encrypted:
+            raise ValueError("This PDF is not password protected.")
+
+        if reader.decrypt(password) == 0:
+            raise ValueError("Incorrect password.")
+
+        writer = PdfWriter()
+        for page in reader.pages:
+            writer.add_page(page)
+
+        with open(out_pdf_path, "wb") as f:
+            writer.write(f)
+
+        background_tasks.add_task(cleanup_temp_dir, temp_dir)
+
+        return FileResponse(
+            out_pdf_path,
+            media_type="application/pdf",
+            filename=os.path.basename(out_pdf_path)
+        )
+    except ValueError as ve:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        raise HTTPException(status_code=401, detail=str(ve))
+    except Exception as e:
+        print("CRITICAL ERROR:")
+        traceback.print_exc()
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        raise HTTPException(status_code=500, detail=f"Unlock failed: {str(e)}")
+
 @app.get("/")
 def health_check():
     return {"status": "online", "service": "SwiftPDF Backend is Running"}
