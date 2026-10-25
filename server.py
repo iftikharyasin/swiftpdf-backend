@@ -1,11 +1,14 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
-from pdf2docx import Converter
+import pymupdf  # Using PyMuPDF
+from docx import Document
+from docx.shared import Pt
 import tempfile
 import os
 import shutil
 import traceback
+import re
 
 app = FastAPI(title="SwiftPDF High-Fidelity Converter API")
 
@@ -23,6 +26,14 @@ def cleanup_temp_dir(temp_dir: str):
     except Exception:
         pass
 
+# Cleans illegal characters and fixes broken word spacing
+def clean_text(text):
+    # Remove weird control characters
+    text = re.sub(r'[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]', '', text)
+    # Fix weird spacing like "p m e n t" back to "pment"
+    text = re.sub(r'\s+(?=[a-zA-Z])', ' ', text) 
+    return " ".join(text.split())
+
 @app.post("/api/convert")
 async def convert_pdf(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
     temp_dir = tempfile.mkdtemp()
@@ -35,19 +46,34 @@ async def convert_pdf(background_tasks: BackgroundTasks, file: UploadFile = File
         with open(in_pdf_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
 
-        # ✅ Using pdf2docx for visual layout preservation
-        cv = Converter(in_pdf_path)
+        doc = pymupdf.open(in_pdf_path)
+        docx = Document()
         
-        # multi_processing=False prevents Render's 512MB RAM from crashing
-        # page_layout_analysis=True helps handle 2-column academic papers
-        cv.convert(
-            out_docx_path, 
-            start=0, 
-            end=None, 
-            multi_processing=False, 
-            page_layout_analysis=True
-        )
-        cv.close()
+        style = docx.styles['Normal']
+        style.font.name = 'Times New Roman'
+        style.font.size = Pt(11)
+
+        # Process each page
+        for page_num in range(len(doc)):
+            page = doc.load_page(page_num)
+            
+            # Extract text as a simple block (ignores complex layouts that cause blank pages)
+            text = page.get_text("text")
+            
+            if text.strip():
+                cleaned_text = clean_text(text)
+                # Split by double newlines to keep paragraphs intact
+                paragraphs = cleaned_text.split('\n\n')
+                for para in paragraphs:
+                    if para.strip():
+                        docx.add_paragraph(para.strip())
+
+            # Add page break after each page to match the PDF structure
+            if page_num < len(doc) - 1:
+                docx.add_page_break()
+
+        docx.save(out_docx_path)
+        doc.close()
 
         if not os.path.exists(out_docx_path) or os.path.getsize(out_docx_path) == 0:
             raise HTTPException(status_code=500, detail="Conversion produced an empty file.")
