@@ -5,3 +5,4 @@ pdf2docx==0.5.6
 pypdf==4.2.0
 cryptography
 Pillow
+ocrmypdf
