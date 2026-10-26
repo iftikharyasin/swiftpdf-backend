@@ -4,6 +4,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pdf2docx import Converter
 from pypdf import PdfReader, PdfWriter
 from PIL import Image
+import ocrmypdf
 import tempfile
 import os
 import shutil
@@ -141,6 +142,7 @@ async def protect_pdf(background_tasks: BackgroundTasks, file: UploadFile = File
 
         reader = PdfReader(in_pdf_path)
         
+        # --- Catch already-encrypted files immediately ---
         if reader.is_encrypted:
             raise ValueError("This file is already encrypted. Please unlock it first.")
         
@@ -216,6 +218,41 @@ async def unlock_pdf(background_tasks: BackgroundTasks, file: UploadFile = File(
         traceback.print_exc()
         shutil.rmtree(temp_dir, ignore_errors=True)
         raise HTTPException(status_code=500, detail=f"Unlock failed: {str(e)}")
+
+
+@app.post("/api/ocr")
+async def ocr_pdf(background_tasks: BackgroundTasks, file: UploadFile = File(...), language: str = Form("eng")):
+    temp_dir = tempfile.mkdtemp()
+    safe_filename = file.filename or "document.pdf"
+    in_pdf_path = os.path.join(temp_dir, safe_filename)
+    out_pdf_path = os.path.join(temp_dir, f"searchable_{safe_filename}")
+
+    try:
+        with open(in_pdf_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+
+        # Run OCRmyPDF engine to scan and embed invisible selectable text
+        ocrmypdf.ocr(
+            in_pdf_path, 
+            out_pdf_path, 
+            language=language, 
+            force_ocr=True,       # Force OCR even if document has some text
+            optimize=1            # Basic optimization to keep file size small
+        )
+
+        background_tasks.add_task(cleanup_temp_dir, temp_dir)
+
+        return FileResponse(
+            out_pdf_path,
+            media_type="application/pdf",
+            filename=os.path.basename(out_pdf_path)
+        )
+    except Exception as e:
+        print("CRITICAL ERROR:")
+        traceback.print_exc()
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        raise HTTPException(status_code=500, detail=f"OCR Processing failed: {str(e)}")
+
 
 @app.get("/")
 def health_check():
