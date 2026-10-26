@@ -229,15 +229,20 @@ async def ocr_pdf(background_tasks: BackgroundTasks, file: UploadFile = File(...
         with open(in_pdf_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
 
+        # Check if the file is encrypted before attempting OCR
+        reader = PdfReader(in_pdf_path)
+        if reader.is_encrypted:
+            raise ValueError("This file is password protected. Please unlock it first.")
+
         # Run OCRmyPDF engine with strict memory limits for Render Free Tier
         ocrmypdf.ocr(
             in_pdf_path, 
             out_pdf_path, 
             language=language, 
             force_ocr=True,
-            optimize=0,                # Disable optimization to save RAM/CPU time
-            jobs=1,                    # Force single job to prevent memory spikes
-            skip_big=10.0              # Skip pages with massive images (must be float)
+            optimize=0,                
+            jobs=1,                    
+            skip_big=10.0              
         )
 
         background_tasks.add_task(cleanup_temp_dir, temp_dir)
@@ -247,6 +252,9 @@ async def ocr_pdf(background_tasks: BackgroundTasks, file: UploadFile = File(...
             media_type="application/pdf",
             filename=os.path.basename(out_pdf_path)
         )
+    except ValueError as ve:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        raise HTTPException(status_code=403, detail=str(ve))
     except Exception as e:
         print("CRITICAL ERROR:")
         traceback.print_exc()
