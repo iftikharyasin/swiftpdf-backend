@@ -235,10 +235,10 @@ async def ocr_pdf(background_tasks: BackgroundTasks, file: UploadFile = File(...
             out_pdf_path, 
             language=language, 
             force_ocr=True,
-            optimize=0,              # Disable optimization to save RAM/CPU time
-            jobs=1,                  # Force single job to prevent memory spikes
-            max_ocr_image_mpixels=8, # Cap huge images at 8 megapixels
-            skip_big=True            # Skip pages with massive images that would crash the server
+            optimize=0,                # Disable optimization to save RAM/CPU time
+            jobs=1,                    # Force single job to prevent memory spikes
+            max_ocr_image_mpixels=8.0, # Cap huge images at 8 megapixels (must be float)
+            skip_big=10.0              # Skip pages with massive images (must be float)
         )
 
         background_tasks.add_task(cleanup_temp_dir, temp_dir)
