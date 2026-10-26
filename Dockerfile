@@ -1,7 +1,7 @@
 # Use a lightweight Python Linux environment
 FROM python:3.10-slim
 
-# Install Tesseract OCR, Ghostscript, and Language Packs
+# Install Tesseract OCR, Ghostscript, Language Packs, and OpenCV Graphics Dependencies
 RUN apt-get update && apt-get install -y \
     tesseract-ocr \
     tesseract-ocr-eng \
@@ -14,6 +14,8 @@ RUN apt-get update && apt-get install -y \
     tesseract-ocr-ara \
     tesseract-ocr-chi-sim \
     ghostscript \
+    libgl1 \
+    libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
 # Set up the working directory
