@@ -78,7 +78,6 @@ async def compress_pdf(background_tasks: BackgroundTasks, file: UploadFile = Fil
         with open(in_pdf_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
 
-        # Apply specific image downsampling rules based on user choice
         if level == "extreme":
             img_quality = 20
             scale_factor = 0.5  
@@ -142,7 +141,6 @@ async def protect_pdf(background_tasks: BackgroundTasks, file: UploadFile = File
 
         reader = PdfReader(in_pdf_path)
         
-        # --- Catch already-encrypted files immediately ---
         if reader.is_encrypted:
             raise ValueError("This file is already encrypted. Please unlock it first.")
         
@@ -231,13 +229,16 @@ async def ocr_pdf(background_tasks: BackgroundTasks, file: UploadFile = File(...
         with open(in_pdf_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
 
-        # Run OCRmyPDF engine to scan and embed invisible selectable text
+        # Run OCRmyPDF engine with strict memory limits for Render Free Tier
         ocrmypdf.ocr(
             in_pdf_path, 
             out_pdf_path, 
             language=language, 
-            force_ocr=True,       # Force OCR even if document has some text
-            optimize=1            # Basic optimization to keep file size small
+            force_ocr=True,
+            optimize=0,              # Disable optimization to save RAM/CPU time
+            jobs=1,                  # Force single job to prevent memory spikes
+            max_ocr_image_mpixels=8, # Cap huge images at 8 megapixels
+            skip_big=True            # Skip pages with massive images that would crash the server
         )
 
         background_tasks.add_task(cleanup_temp_dir, temp_dir)
