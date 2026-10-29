@@ -40,7 +40,6 @@ async def convert_pdf(background_tasks: BackgroundTasks, file: UploadFile = File
         with open(in_pdf_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
 
-        # Check if the PDF is password-protected before running pdf2docx
         try:
             with pikepdf.open(in_pdf_path) as _:
                 pass
@@ -161,7 +160,6 @@ async def protect_pdf(background_tasks: BackgroundTasks, file: UploadFile = File
         if not clean_password:
             raise ValueError("Password cannot be empty.")
 
-        # Use pikepdf (QPDF) for rock-solid AES-256 encryption and accurate lock detection
         try:
             with pikepdf.open(in_pdf_path) as pdf:
                 if pdf.is_encrypted:
@@ -171,7 +169,7 @@ async def protect_pdf(background_tasks: BackgroundTasks, file: UploadFile = File
                     encryption=pikepdf.Encryption(
                         user=clean_password,
                         owner=clean_password,
-                        R=6  # Enterprise AES-256 encryption
+                        R=6
                     )
                 )
         except pikepdf.PasswordError:
@@ -195,7 +193,7 @@ async def protect_pdf(background_tasks: BackgroundTasks, file: UploadFile = File
 
 
 @app.post("/api/unlock")
-async def unlock_pdf(background_tasks: BackgroundTasks, file: UploadFile = File(...), password: str = Form(...)):
+async def unlock_pdf(background_tasks: BackgroundTasks, file: UploadFile = File(...), password: str = Form("")):
     temp_dir = tempfile.mkdtemp()
     safe_filename = file.filename or "document.pdf"
     in_pdf_path = os.path.join(temp_dir, safe_filename)
@@ -205,47 +203,45 @@ async def unlock_pdf(background_tasks: BackgroundTasks, file: UploadFile = File(
         with open(in_pdf_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
 
-        # 1. First check if the PDF can be opened without any password
-        is_locked = False
-        try:
-            with pikepdf.open(in_pdf_path) as pdf_test:
-                if not pdf_test.is_encrypted:
-                    shutil.rmtree(temp_dir, ignore_errors=True)
-                    raise HTTPException(status_code=400, detail="This PDF is not password protected.")
-                is_locked = True
-        except pikepdf.PasswordError:
-            is_locked = True
-
-        # 2. Try unlocking with pikepdf (handles AES-256 R5/R6, AES-128, and RC4 natively)
+        clean_pwd = password.strip() if password else ""
         unlocked_success = False
-        passwords_to_try = [password]
-        if password.strip() != password:
-            passwords_to_try.append(password.strip())
 
+        # Gather variations of passwords to try (user password, stripped, and blank)
+        passwords_to_try = [clean_pwd]
+        if "" not in passwords_to_try:
+            passwords_to_try.append("")
+        if password and password != clean_pwd:
+            passwords_to_try.append(password)
+
+        # Try unlocking with pikepdf
         for pwd in passwords_to_try:
             try:
                 with pikepdf.open(in_pdf_path, password=pwd) as pdf:
+                    pdf.remove_security()
                     pdf.save(out_pdf_path)
                     unlocked_success = True
                     break
-            except pikepdf.PasswordError:
+            except Exception:
                 continue
 
-        # 3. Fallback to pypdf if pikepdf didn't unlock it
+        # Fallback to pypdf if pikepdf didn't catch it
         if not unlocked_success:
             try:
                 reader = PdfReader(in_pdf_path)
                 for pwd in passwords_to_try:
-                    if reader.decrypt(pwd) > 0:
-                        writer = PdfWriter()
-                        for page in reader.pages:
-                            writer.add_page(page)
-                        with open(out_pdf_path, "wb") as f:
-                            writer.write(f)
-                        unlocked_success = True
-                        break
-            except Exception as fallback_err:
-                print(f"pypdf fallback error: {fallback_err}")
+                    try:
+                        if not reader.is_encrypted or reader.decrypt(pwd) > 0:
+                            writer = PdfWriter()
+                            for page in reader.pages:
+                                writer.add_page(page)
+                            with open(out_pdf_path, "wb") as f:
+                                writer.write(f)
+                            unlocked_success = True
+                            break
+                    except Exception:
+                        continue
+            except Exception as pypdf_err:
+                print(f"pypdf fallback unlock error: {pypdf_err}")
 
         if not unlocked_success:
             shutil.rmtree(temp_dir, ignore_errors=True)
@@ -278,7 +274,6 @@ async def ocr_pdf(background_tasks: BackgroundTasks, file: UploadFile = File(...
         with open(in_pdf_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
 
-        # Check if the file is encrypted before attempting OCR
         try:
             with pikepdf.open(in_pdf_path) as pdf_check:
                 if pdf_check.is_encrypted:
@@ -286,7 +281,6 @@ async def ocr_pdf(background_tasks: BackgroundTasks, file: UploadFile = File(...
         except pikepdf.PasswordError:
             raise ValueError("This file is password protected. Please unlock it first.")
 
-        # Run OCRmyPDF engine with strict memory limits for Render Free Tier
         ocrmypdf.ocr(
             in_pdf_path,
             out_pdf_path,
