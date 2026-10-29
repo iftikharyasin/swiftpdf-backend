@@ -9,6 +9,7 @@ import ocrmypdf
 import tempfile
 import os
 import shutil
+import subprocess
 import traceback
 
 app = FastAPI(title="Optimax PDF High-Fidelity Cloud API")
@@ -206,14 +207,13 @@ async def unlock_pdf(background_tasks: BackgroundTasks, file: UploadFile = File(
         clean_pwd = password.strip() if password else ""
         unlocked_success = False
 
-        # Gather variations of passwords to try (user password, stripped, and blank)
         passwords_to_try = [clean_pwd]
         if "" not in passwords_to_try:
             passwords_to_try.append("")
         if password and password != clean_pwd:
             passwords_to_try.append(password)
 
-        # Try unlocking with pikepdf
+        # Tier 1: Try unlocking with pikepdf
         for pwd in passwords_to_try:
             try:
                 with pikepdf.open(in_pdf_path, password=pwd) as pdf:
@@ -221,23 +221,38 @@ async def unlock_pdf(background_tasks: BackgroundTasks, file: UploadFile = File(
                     pdf.save(out_pdf_path)
                     unlocked_success = True
                     break
-            except Exception:
-                continue
+    except Exception:
+                pass
 
-        # Fallback to pypdf if pikepdf didn't catch it
+        # Tier 2: Try qpdf command-line tool directly (handles stubborn legacy/encrypted streams)
+        if not unlocked_success:
+            for pwd in passwords_to_try:
+                try:
+                    cmd = ["qpdf", f"--password={pwd}", "--decrypt", in_pdf_path, out_pdf_path]
+                    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                    if result.returncode == 0 and os.path.exists(out_pdf_path) and os.path.getsize(out_pdf_path) > 0:
+                        unlocked_success = True
+                        break
+                except Exception:
+                    pass
+
+        # Tier 3: Fallback to pypdf
         if not unlocked_success:
             try:
                 reader = PdfReader(in_pdf_path)
                 for pwd in passwords_to_try:
                     try:
-                        if not reader.is_encrypted or reader.decrypt(pwd) > 0:
-                            writer = PdfWriter()
-                            for page in reader.pages:
-                                writer.add_page(page)
-                            with open(out_pdf_path, "wb") as f:
-                                writer.write(f)
-                            unlocked_success = True
-                            break
+                        if reader.is_encrypted:
+                            reader.decrypt(pwd)
+                        
+                        writer = PdfWriter()
+                        for page in reader.pages:
+                            writer.add_page(page)
+                        
+                        with open(out_pdf_path, "wb") as f:
+                            writer.write(f)
+                        unlocked_success = True
+                        break
                     except Exception:
                         continue
             except Exception as pypdf_err:
