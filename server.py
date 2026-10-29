@@ -472,17 +472,27 @@ async def pdf_to_excel(background_tasks: BackgroundTasks, file: UploadFile = Fil
             shutil.copyfileobj(file.file, buffer)
 
         all_tables = []
-        # Extract tables using pdfplumber
         with pdfplumber.open(in_pdf_path) as pdf:
             for page in pdf.pages:
+                # 1. Try the default line-based extraction first
                 tables = page.extract_tables()
+                
+                # 2. Fallback: If no borders exist, extract based on text spacing alignment
+                if not tables:
+                    tables = page.extract_tables({
+                        "vertical_strategy": "text", 
+                        "horizontal_strategy": "text",
+                        "intersection_y_tolerance": 15
+                    })
+
                 for table in tables:
-                    # Convert raw grid directly into pandas dataframe
-                    df = pd.DataFrame(table)
+                    # Clean the table data (replace None with empty strings)
+                    cleaned_table = [[cell if cell is not None else "" for cell in row] for row in table]
+                    df = pd.DataFrame(cleaned_table)
                     all_tables.append(df)
 
         if not all_tables:
-            raise ValueError("No tabular data detected in this PDF.")
+            raise ValueError("No tabular data detected in this PDF. Ensure the document contains structured columns.")
 
         # Write each table to a separate sheet in the Excel file
         with pd.ExcelWriter(out_xlsx_path, engine='openpyxl') as writer:
