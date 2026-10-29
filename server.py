@@ -90,9 +90,15 @@ async def word_to_pdf(background_tasks: BackgroundTasks, file: UploadFile = File
         with open(in_docx_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
 
-        # Convert DOCX to PDF using LibreOffice headless
+        # Convert DOCX to PDF using LibreOffice with optimized layout filters
         process = subprocess.run(
-            ["libreoffice", "--headless", "--convert-to", "pdf", "--outdir", temp_dir, in_docx_path],
+            [
+                "libreoffice", 
+                "--headless", 
+                "--convert-to", "pdf", 
+                "--outdir", temp_dir, 
+                in_docx_path
+            ],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE
         )
