@@ -9,6 +9,7 @@ import ocrmypdf
 import tempfile
 import os
 import shutil
+import subprocess
 import traceback
 
 app = FastAPI(title="Optimax PDF High-Fidelity Cloud API")
@@ -75,6 +76,50 @@ async def convert_pdf(background_tasks: BackgroundTasks, file: UploadFile = File
         traceback.print_exc()
         shutil.rmtree(temp_dir, ignore_errors=True)
         raise HTTPException(status_code=500, detail=f"Conversion failed: {str(e)}")
+
+
+@app.post("/api/word-to-pdf")
+async def word_to_pdf(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
+    temp_dir = tempfile.mkdtemp()
+    safe_filename = file.filename or "document.docx"
+    in_docx_path = os.path.join(temp_dir, safe_filename)
+    base_name = os.path.splitext(safe_filename)[0]
+    out_pdf_path = os.path.join(temp_dir, f"OptimaxPDF_WordToPDF_{base_name}.pdf")
+
+    try:
+        with open(in_docx_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+
+        # Convert DOCX to PDF using LibreOffice headless
+        process = subprocess.run(
+            ["libreoffice", "--headless", "--convert-to", "pdf", "--outdir", temp_dir, in_docx_path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE
+        )
+
+        generated_pdf = os.path.join(temp_dir, f"{base_name}.pdf")
+        if not os.path.exists(generated_pdf):
+            for f in os.listdir(temp_dir):
+                if f.endswith(".pdf"):
+                    generated_pdf = os.path.join(temp_dir, f)
+                    break
+
+        if not os.path.exists(generated_pdf) or os.path.getsize(generated_pdf) == 0:
+            raise HTTPException(status_code=500, detail="Word to PDF conversion produced an empty file.")
+
+        shutil.move(generated_pdf, out_pdf_path)
+        background_tasks.add_task(cleanup_temp_dir, temp_dir)
+
+        return FileResponse(
+            out_pdf_path,
+            media_type="application/pdf",
+            filename=os.path.basename(out_pdf_path)
+        )
+    except Exception as e:
+        print("CRITICAL ERROR:")
+        traceback.print_exc()
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        raise HTTPException(status_code=500, detail=f"Word to PDF conversion failed: {str(e)}")
 
 
 @app.post("/api/compress")
