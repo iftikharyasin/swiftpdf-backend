@@ -6,3 +6,4 @@ pypdf==4.2.0
 cryptography
 Pillow
 ocrmypdf
+pikepdf
