@@ -368,7 +368,7 @@ async def ocr_pdf(background_tasks: BackgroundTasks, file: UploadFile = File(...
 
 
 # ---------------------------------------------------------
-# NEW ROUTES: Excel to PDF, PPT to PDF, and PDF to Excel
+# EXCEL TO PDF (With Smart Landscape & Fit-To-Page Formatting)
 # ---------------------------------------------------------
 
 @app.post("/api/excel-to-pdf")
@@ -377,20 +377,55 @@ async def excel_to_pdf(background_tasks: BackgroundTasks, file: UploadFile = Fil
     safe_filename = file.filename or "document.xlsx"
     in_path = os.path.join(temp_dir, safe_filename)
     base_name = os.path.splitext(safe_filename)[0]
+    ext = os.path.splitext(safe_filename)[1].lower()
+    
     out_pdf_path = os.path.join(temp_dir, f"OptimaxPDF_ExcelToPDF_{base_name}.pdf")
 
     try:
         with open(in_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
 
+        target_conversion_path = in_path
+        
+        # Smart formatting to prevent columns from splitting across pages
+        try:
+            from openpyxl import load_workbook
+            from openpyxl.worksheet.properties import PageSetupProperties
+            
+            if ext == '.csv':
+                df = pd.read_csv(in_path)
+                target_conversion_path = os.path.join(temp_dir, f"{base_name}_formatted.xlsx")
+                df.to_excel(target_conversion_path, index=False)
+            
+            if target_conversion_path.endswith('.xlsx'):
+                wb = load_workbook(target_conversion_path)
+                for sheetname in wb.sheetnames:
+                    ws = wb[sheetname]
+                    ws.page_setup.orientation = "landscape"
+                    ws.page_setup.fitToPage = True
+                    ws.page_setup.fitToHeight = 0  # Allow vertical scrolling
+                    ws.page_setup.fitToWidth = 1   # Force all columns onto 1 page width
+                    
+                    if ws.sheet_properties.pageSetUpPr is None:
+                        ws.sheet_properties.pageSetUpPr = PageSetupProperties(fitToPage=True)
+                    else:
+                        ws.sheet_properties.pageSetUpPr.fitToPage = True
+                        
+                wb.save(target_conversion_path)
+        except Exception as format_err:
+            print(f"Skipping smart formatting fallback: {format_err}")
+            target_conversion_path = in_path
+
         # Convert using LibreOffice
         subprocess.run(
-            ["libreoffice", "--headless", "--convert-to", "pdf", "--outdir", temp_dir, in_path],
+            ["libreoffice", "--headless", "--convert-to", "pdf", "--outdir", temp_dir, target_conversion_path],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE
         )
         
         # Robust file finding
-        generated_pdf = os.path.join(temp_dir, f"{base_name}.pdf")
+        converted_base = os.path.splitext(os.path.basename(target_conversion_path))[0]
+        generated_pdf = os.path.join(temp_dir, f"{converted_base}.pdf")
+        
         if not os.path.exists(generated_pdf):
             for f in os.listdir(temp_dir):
                 if f.endswith(".pdf"):
