@@ -11,6 +11,8 @@ import os
 import shutil
 import subprocess
 import traceback
+import pdfplumber
+import pandas as pd
 
 app = FastAPI(title="Optimax PDF High-Fidelity Cloud API")
 
@@ -363,6 +365,145 @@ async def ocr_pdf(background_tasks: BackgroundTasks, file: UploadFile = File(...
         traceback.print_exc()
         shutil.rmtree(temp_dir, ignore_errors=True)
         raise HTTPException(status_code=500, detail=f"OCR Processing failed: {str(e)}")
+
+
+# ---------------------------------------------------------
+# NEW ROUTES: Excel to PDF, PPT to PDF, and PDF to Excel
+# ---------------------------------------------------------
+
+@app.post("/api/excel-to-pdf")
+async def excel_to_pdf(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
+    temp_dir = tempfile.mkdtemp()
+    safe_filename = file.filename or "document.xlsx"
+    in_path = os.path.join(temp_dir, safe_filename)
+    base_name = os.path.splitext(safe_filename)[0]
+    out_pdf_path = os.path.join(temp_dir, f"OptimaxPDF_ExcelToPDF_{base_name}.pdf")
+
+    try:
+        with open(in_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+
+        # Convert using LibreOffice
+        subprocess.run(
+            ["libreoffice", "--headless", "--convert-to", "pdf", "--outdir", temp_dir, in_path],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        )
+        
+        # Robust file finding
+        generated_pdf = os.path.join(temp_dir, f"{base_name}.pdf")
+        if not os.path.exists(generated_pdf):
+            for f in os.listdir(temp_dir):
+                if f.endswith(".pdf"):
+                    generated_pdf = os.path.join(temp_dir, f)
+                    break
+        
+        if not os.path.exists(generated_pdf) or os.path.getsize(generated_pdf) == 0:
+            raise HTTPException(status_code=500, detail="LibreOffice failed to generate PDF. Check file formatting.")
+
+        shutil.move(generated_pdf, out_pdf_path)
+        background_tasks.add_task(cleanup_temp_dir, temp_dir)
+        
+        return FileResponse(
+            out_pdf_path, 
+            media_type="application/pdf", 
+            filename=os.path.basename(out_pdf_path)
+        )
+    except Exception as e:
+        print("CRITICAL ERROR IN EXCEL TO PDF:")
+        traceback.print_exc()
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        raise HTTPException(status_code=500, detail=f"Conversion failed: {str(e)}")
+
+
+@app.post("/api/ppt-to-pdf")
+async def ppt_to_pdf(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
+    temp_dir = tempfile.mkdtemp()
+    safe_filename = file.filename or "document.pptx"
+    in_path = os.path.join(temp_dir, safe_filename)
+    base_name = os.path.splitext(safe_filename)[0]
+    out_pdf_path = os.path.join(temp_dir, f"OptimaxPDF_PPTtoPDF_{base_name}.pdf")
+
+    try:
+        with open(in_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+
+        # Convert using LibreOffice
+        subprocess.run(
+            ["libreoffice", "--headless", "--convert-to", "pdf", "--outdir", temp_dir, in_path],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        )
+        
+        # Robust file finding
+        generated_pdf = os.path.join(temp_dir, f"{base_name}.pdf")
+        if not os.path.exists(generated_pdf):
+            for f in os.listdir(temp_dir):
+                if f.endswith(".pdf"):
+                    generated_pdf = os.path.join(temp_dir, f)
+                    break
+        
+        if not os.path.exists(generated_pdf) or os.path.getsize(generated_pdf) == 0:
+            raise HTTPException(status_code=500, detail="LibreOffice failed to generate PDF. Check file formatting.")
+
+        shutil.move(generated_pdf, out_pdf_path)
+        background_tasks.add_task(cleanup_temp_dir, temp_dir)
+        
+        return FileResponse(
+            out_pdf_path, 
+            media_type="application/pdf", 
+            filename=os.path.basename(out_pdf_path)
+        )
+    except Exception as e:
+        print("CRITICAL ERROR IN PPT TO PDF:")
+        traceback.print_exc()
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        raise HTTPException(status_code=500, detail=f"Conversion failed: {str(e)}")
+
+
+@app.post("/api/pdf-to-excel")
+async def pdf_to_excel(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
+    temp_dir = tempfile.mkdtemp()
+    safe_filename = file.filename or "document.pdf"
+    in_pdf_path = os.path.join(temp_dir, safe_filename)
+    base_name = os.path.splitext(safe_filename)[0]
+    out_xlsx_path = os.path.join(temp_dir, f"OptimaxPDF_Extracted_{base_name}.xlsx")
+
+    try:
+        with open(in_pdf_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+
+        all_tables = []
+        # Extract tables using pdfplumber
+        with pdfplumber.open(in_pdf_path) as pdf:
+            for page in pdf.pages:
+                tables = page.extract_tables()
+                for table in tables:
+                    # Convert raw grid directly into pandas dataframe
+                    df = pd.DataFrame(table)
+                    all_tables.append(df)
+
+        if not all_tables:
+            raise ValueError("No tabular data detected in this PDF.")
+
+        # Write each table to a separate sheet in the Excel file
+        with pd.ExcelWriter(out_xlsx_path, engine='openpyxl') as writer:
+            for idx, df in enumerate(all_tables):
+                df.to_excel(writer, sheet_name=f"Table_{idx+1}", index=False, header=False)
+
+        background_tasks.add_task(cleanup_temp_dir, temp_dir)
+        
+        return FileResponse(
+            out_xlsx_path, 
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", 
+            filename=os.path.basename(out_xlsx_path)
+        )
+    except ValueError as ve:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        raise HTTPException(status_code=400, detail=str(ve))
+    except Exception as e:
+        print("CRITICAL ERROR IN PDF TO EXCEL:")
+        traceback.print_exc()
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        raise HTTPException(status_code=500, detail=f"Table extraction failed: {str(e)}")
 
 
 @app.get("/")
