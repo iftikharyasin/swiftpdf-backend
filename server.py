@@ -403,7 +403,7 @@ async def excel_to_pdf(background_tasks: BackgroundTasks, file: UploadFile = Fil
 
         target_conversion_path = in_path
         
-        # Smart formatting to prevent columns from splitting across pages
+        # Smart formatting: Force Landscape and Fit-to-Width so wide columns don't split across pages
         try:
             from openpyxl import load_workbook
             from openpyxl.worksheet.properties import PageSetupProperties
