@@ -10,3 +10,5 @@ pikepdf
 pdfplumber
 pandas
 openpyxl
+rembg==2.0.57
+onnxruntime==1.17.3
