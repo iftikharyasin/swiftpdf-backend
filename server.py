@@ -594,7 +594,7 @@ async def pdf_to_excel(background_tasks: BackgroundTasks, file: UploadFile = Fil
 
 @app.post("/api/remove-background")
 async def remove_background(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
-    check_file_size(file, max_mb=10) # 10MB limit is safe for RAM-heavy image processing
+    check_file_size(file, max_mb=10)
     temp_dir = tempfile.mkdtemp()
     safe_filename = file.filename or "image.png"
     in_path = os.path.join(temp_dir, safe_filename)
@@ -605,15 +605,21 @@ async def remove_background(background_tasks: BackgroundTasks, file: UploadFile 
         with open(in_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
 
-        from rembg import remove
-        
-        with open(in_path, 'rb') as i:
-            input_data = i.read()
-            # The AI model processes the image and removes the background
-            output_data = remove(input_data)
-            
-        with open(out_path, 'wb') as o:
-            o.write(output_data)
+        try:
+            from rembg import remove
+            with open(in_path, 'rb') as i:
+                input_data = i.read()
+                output_data = remove(input_data)
+                
+            with open(out_path, 'wb') as o:
+                o.write(output_data)
+        except Exception as ai_err:
+            print(f"REMBG AI ENGINE ERROR: {str(ai_err)}")
+            traceback.print_exc()
+            raise ValueError(f"AI background model error: {str(ai_err)}")
+
+        if not os.path.exists(out_path) or os.path.getsize(out_path) == 0:
+            raise HTTPException(status_code=500, detail="Background removal produced an empty file.")
 
         background_tasks.add_task(cleanup_temp_dir, temp_dir)
 
@@ -627,7 +633,6 @@ async def remove_background(background_tasks: BackgroundTasks, file: UploadFile 
         raise HTTPException(status_code=400, detail=str(ve))
     except Exception as e:
         print("CRITICAL ERROR IN BACKGROUND REMOVAL:")
-        import traceback
         traceback.print_exc()
         shutil.rmtree(temp_dir, ignore_errors=True)
         raise HTTPException(status_code=500, detail=f"Background removal failed: {str(e)}")
