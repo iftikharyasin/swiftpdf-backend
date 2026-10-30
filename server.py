@@ -512,7 +512,7 @@ async def ppt_to_pdf(background_tasks: BackgroundTasks, file: UploadFile = File(
 
 
 @app.post("/api/pdf-to-excel")
-async def pdf_to_excel(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
+async def pdf_to_excel(background_tasks: BackgroundTasks, file: UploadFile = File(...), ocr: bool = Form(False)):
     check_file_size(file, max_mb=20)
     temp_dir = tempfile.mkdtemp()
     safe_filename = file.filename or "document.pdf"
@@ -524,15 +524,31 @@ async def pdf_to_excel(background_tasks: BackgroundTasks, file: UploadFile = Fil
         with open(in_pdf_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
 
+        # Apply OCR if requested by the frontend
+        target_pdf_path = in_pdf_path
+        if ocr:
+            ocr_pdf_path = os.path.join(temp_dir, f"ocr_{safe_filename}")
+            try:
+                ocrmypdf.ocr(
+                    in_pdf_path,
+                    ocr_pdf_path,
+                    language="eng",
+                    force_ocr=True,
+                    optimize=0,
+                    jobs=1,
+                    skip_big=10.0
+                )
+                target_pdf_path = ocr_pdf_path
+            except Exception as e:
+                print(f"OCR step failed during PDF to Excel: {e}")
+                # Fallback to the original PDF if OCR fails
+
         all_tables = []
-        with pdfplumber.open(in_pdf_path) as pdf:
+        with pdfplumber.open(target_pdf_path) as pdf:
             master_data = []
             
             for page in pdf.pages:
-                # 1. Try the default line-based extraction first
                 tables = page.extract_tables()
-                
-                # 2. Fallback: If no borders exist, extract based on text spacing alignment
                 if not tables:
                     tables = page.extract_tables({
                         "vertical_strategy": "text", 
@@ -541,41 +557,32 @@ async def pdf_to_excel(background_tasks: BackgroundTasks, file: UploadFile = Fil
                     })
 
                 for table in tables:
-                    # Clean the table data (replace None with empty strings)
                     cleaned_table = [[cell if cell is not None else "" for cell in row] for row in table]
-                    
-                    # If this is the very first table, just append it
                     if not master_data:
                         master_data.extend(cleaned_table)
                     else:
-                        # If subsequent tables have the same number of columns as the master data,
-                        # append the rows to the master data instead of creating a new sheet.
-                        # Also, if the first row of this new table looks exactly like our headers, skip it.
                         num_cols_master = len(master_data[0]) if master_data else 0
                         num_cols_new = len(cleaned_table[0]) if cleaned_table else 0
                         
                         if num_cols_new == num_cols_master:
-                            # Check if the first row is a duplicate header
+                            # Strip duplicate headers spanning multiple pages
                             if cleaned_table and cleaned_table[0] == master_data[0]:
                                 master_data.extend(cleaned_table[1:])
                             else:
                                 master_data.extend(cleaned_table)
                         else:
-                            # If columns don't match, we have to start a new table/sheet.
                             if master_data:
                                 df = pd.DataFrame(master_data)
                                 all_tables.append(df)
                             master_data = cleaned_table
 
-            # Append the final working master_data
             if master_data:
                 df = pd.DataFrame(master_data)
                 all_tables.append(df)
 
         if not all_tables:
-            raise ValueError("No tabular data detected in this PDF. Ensure the document contains structured columns.")
+            raise ValueError("No tabular data detected in this PDF. If this is a scanned document, please enable the OCR option.")
 
-        # Write each distinct table structure to a separate sheet
         with pd.ExcelWriter(out_xlsx_path, engine='openpyxl') as writer:
             for idx, df in enumerate(all_tables):
                 df.to_excel(writer, sheet_name=f"Table_{idx+1}", index=False, header=False)
