@@ -4,11 +4,9 @@ python-multipart==0.0.9
 pdf2docx==0.5.6
 pypdf==4.2.0
 cryptography
-pillow>=10.0.0
+pillow
 ocrmypdf
 pikepdf
 pdfplumber
 pandas
 openpyxl
-rembg==2.0.57
-onnxruntime==1.17.3
