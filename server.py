@@ -524,7 +524,7 @@ async def pdf_to_excel(background_tasks: BackgroundTasks, file: UploadFile = Fil
         with open(in_pdf_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
 
-        # Apply OCR if requested by the frontend
+        # Apply OCR if requested by frontend
         target_pdf_path = in_pdf_path
         if ocr:
             ocr_pdf_path = os.path.join(temp_dir, f"ocr_{safe_filename}")
@@ -541,14 +541,15 @@ async def pdf_to_excel(background_tasks: BackgroundTasks, file: UploadFile = Fil
                 target_pdf_path = ocr_pdf_path
             except Exception as e:
                 print(f"OCR step failed during PDF to Excel: {e}")
-                # Fallback to the original PDF if OCR fails
 
-        all_tables = []
+        # Extract and flatten all rows into a single continuous list
+        all_rows = []
         with pdfplumber.open(target_pdf_path) as pdf:
-            master_data = []
-            
             for page in pdf.pages:
+                # 1. Try lattice (lines)
                 tables = page.extract_tables()
+                
+                # 2. Try stream (text alignment) if no borders
                 if not tables:
                     tables = page.extract_tables({
                         "vertical_strategy": "text", 
@@ -557,35 +558,23 @@ async def pdf_to_excel(background_tasks: BackgroundTasks, file: UploadFile = Fil
                     })
 
                 for table in tables:
-                    cleaned_table = [[cell if cell is not None else "" for cell in row] for row in table]
-                    if not master_data:
-                        master_data.extend(cleaned_table)
-                    else:
-                        num_cols_master = len(master_data[0]) if master_data else 0
-                        num_cols_new = len(cleaned_table[0]) if cleaned_table else 0
+                    for row in table:
+                        # Clean up newlines and None values
+                        cleaned_row = [cell.replace('\n', ' ') if cell is not None else "" for cell in row]
                         
-                        if num_cols_new == num_cols_master:
-                            # Strip duplicate headers spanning multiple pages
-                            if cleaned_table and cleaned_table[0] == master_data[0]:
-                                master_data.extend(cleaned_table[1:])
-                            else:
-                                master_data.extend(cleaned_table)
-                        else:
-                            if master_data:
-                                df = pd.DataFrame(master_data)
-                                all_tables.append(df)
-                            master_data = cleaned_table
+                        # Only append the row if it actually contains data
+                        if any(cell.strip() for cell in cleaned_row):
+                            all_rows.append(cleaned_row)
 
-            if master_data:
-                df = pd.DataFrame(master_data)
-                all_tables.append(df)
-
-        if not all_tables:
+        if not all_rows:
             raise ValueError("No tabular data detected in this PDF. If this is a scanned document, please enable the OCR option.")
 
+        # Convert the unified list of rows into a single DataFrame
+        df = pd.DataFrame(all_rows)
+
+        # Write to a single sheet, just like iLovePDF
         with pd.ExcelWriter(out_xlsx_path, engine='openpyxl') as writer:
-            for idx, df in enumerate(all_tables):
-                df.to_excel(writer, sheet_name=f"Table_{idx+1}", index=False, header=False)
+            df.to_excel(writer, sheet_name="Table_Data", index=False, header=False)
 
         background_tasks.add_task(cleanup_temp_dir, temp_dir)
         
