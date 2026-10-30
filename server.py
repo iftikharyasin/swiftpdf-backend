@@ -592,6 +592,46 @@ async def pdf_to_excel(background_tasks: BackgroundTasks, file: UploadFile = Fil
         shutil.rmtree(temp_dir, ignore_errors=True)
         raise HTTPException(status_code=500, detail=f"Table extraction failed: {str(e)}")
 
+@app.post("/api/remove-background")
+async def remove_background(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
+    check_file_size(file, max_mb=10) # 10MB limit is safe for RAM-heavy image processing
+    temp_dir = tempfile.mkdtemp()
+    safe_filename = file.filename or "image.png"
+    in_path = os.path.join(temp_dir, safe_filename)
+    base_name = os.path.splitext(safe_filename)[0]
+    out_path = os.path.join(temp_dir, f"Optimax_NoBG_{base_name}.png")
+
+    try:
+        with open(in_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+
+        from rembg import remove
+        
+        with open(in_path, 'rb') as i:
+            input_data = i.read()
+            # The AI model processes the image and removes the background
+            output_data = remove(input_data)
+            
+        with open(out_path, 'wb') as o:
+            o.write(output_data)
+
+        background_tasks.add_task(cleanup_temp_dir, temp_dir)
+
+        return FileResponse(
+            out_path,
+            media_type="image/png",
+            filename=os.path.basename(out_path)
+        )
+    except ValueError as ve:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        raise HTTPException(status_code=400, detail=str(ve))
+    except Exception as e:
+        print("CRITICAL ERROR IN BACKGROUND REMOVAL:")
+        import traceback
+        traceback.print_exc()
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        raise HTTPException(status_code=500, detail=f"Background removal failed: {str(e)}")
+
 
 @app.get("/")
 def health_check():
