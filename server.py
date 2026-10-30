@@ -30,9 +30,23 @@ def cleanup_temp_dir(temp_dir: str):
     except Exception:
         pass
 
+# --- HELPER FUNCTION: FILE SIZE CHECK ---
+def check_file_size(file: UploadFile, max_mb: int):
+    # Check if the file has a size attribute by reading to the end
+    file.file.seek(0, 2) 
+    file_size = file.file.tell() 
+    file.file.seek(0) 
+    
+    if file_size > max_mb * 1024 * 1024:
+        raise HTTPException(
+            status_code=413, 
+            detail=f"File too large. Maximum allowed size for this tool is {max_mb} MB."
+        )
+
 
 @app.post("/api/convert")
 async def convert_pdf(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
+    check_file_size(file, max_mb=15)
     temp_dir = tempfile.mkdtemp()
     safe_filename = file.filename or "document.pdf"
     in_pdf_path = os.path.join(temp_dir, safe_filename)
@@ -82,6 +96,7 @@ async def convert_pdf(background_tasks: BackgroundTasks, file: UploadFile = File
 
 @app.post("/api/word-to-pdf")
 async def word_to_pdf(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
+    check_file_size(file, max_mb=20)
     temp_dir = tempfile.mkdtemp()
     safe_filename = file.filename or "document.docx"
     in_docx_path = os.path.join(temp_dir, safe_filename)
@@ -132,6 +147,7 @@ async def word_to_pdf(background_tasks: BackgroundTasks, file: UploadFile = File
 
 @app.post("/api/compress")
 async def compress_pdf(background_tasks: BackgroundTasks, file: UploadFile = File(...), level: str = Form("medium")):
+    check_file_size(file, max_mb=50)
     temp_dir = tempfile.mkdtemp()
     safe_filename = file.filename or "document.pdf"
     in_pdf_path = os.path.join(temp_dir, safe_filename)
@@ -200,6 +216,7 @@ async def compress_pdf(background_tasks: BackgroundTasks, file: UploadFile = Fil
 
 @app.post("/api/protect")
 async def protect_pdf(background_tasks: BackgroundTasks, file: UploadFile = File(...), password: str = Form(...)):
+    check_file_size(file, max_mb=30)
     temp_dir = tempfile.mkdtemp()
     safe_filename = file.filename or "document.pdf"
     in_pdf_path = os.path.join(temp_dir, safe_filename)
@@ -247,6 +264,7 @@ async def protect_pdf(background_tasks: BackgroundTasks, file: UploadFile = File
 
 @app.post("/api/unlock")
 async def unlock_pdf(background_tasks: BackgroundTasks, file: UploadFile = File(...), password: str = Form("")):
+    check_file_size(file, max_mb=30)
     temp_dir = tempfile.mkdtemp()
     safe_filename = file.filename or "document.pdf"
     in_pdf_path = os.path.join(temp_dir, safe_filename)
@@ -324,6 +342,7 @@ async def unlock_pdf(background_tasks: BackgroundTasks, file: UploadFile = File(
 
 @app.post("/api/ocr")
 async def ocr_pdf(background_tasks: BackgroundTasks, file: UploadFile = File(...), language: str = Form("eng")):
+    check_file_size(file, max_mb=10)
     temp_dir = tempfile.mkdtemp()
     safe_filename = file.filename or "document.pdf"
     in_pdf_path = os.path.join(temp_dir, safe_filename)
@@ -367,12 +386,9 @@ async def ocr_pdf(background_tasks: BackgroundTasks, file: UploadFile = File(...
         raise HTTPException(status_code=500, detail=f"OCR Processing failed: {str(e)}")
 
 
-# ---------------------------------------------------------
-# EXCEL TO PDF (With Smart Landscape & Fit-To-Page Formatting)
-# ---------------------------------------------------------
-
 @app.post("/api/excel-to-pdf")
 async def excel_to_pdf(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
+    check_file_size(file, max_mb=20)
     temp_dir = tempfile.mkdtemp()
     safe_filename = file.filename or "document.xlsx"
     in_path = os.path.join(temp_dir, safe_filename)
@@ -452,6 +468,7 @@ async def excel_to_pdf(background_tasks: BackgroundTasks, file: UploadFile = Fil
 
 @app.post("/api/ppt-to-pdf")
 async def ppt_to_pdf(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
+    check_file_size(file, max_mb=20)
     temp_dir = tempfile.mkdtemp()
     safe_filename = file.filename or "document.pptx"
     in_path = os.path.join(temp_dir, safe_filename)
@@ -496,6 +513,7 @@ async def ppt_to_pdf(background_tasks: BackgroundTasks, file: UploadFile = File(
 
 @app.post("/api/pdf-to-excel")
 async def pdf_to_excel(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
+    check_file_size(file, max_mb=20)
     temp_dir = tempfile.mkdtemp()
     safe_filename = file.filename or "document.pdf"
     in_pdf_path = os.path.join(temp_dir, safe_filename)
