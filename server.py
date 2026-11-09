@@ -254,6 +254,63 @@ def task_pdf_to_word(job_dir: str, params: dict) -> dict:
     return {}
 
 
+# Image modes that carry an alpha channel of their own.
+TRANSPARENT_MODES = {"RGBA", "LA", "La", "PA", "RGBa"}
+
+# Modes we do not re-encode, to avoid a colour shift. JPEG has no CMYK path
+# that survives a round trip through Pillow without changing the colours.
+NO_RECODE_MODES = {"CMYK", "YCCK"}
+
+
+def _image_stream(img):
+    """The PDF image XObject behind a pypdf image, or None if it is not reachable."""
+    try:
+        reference = getattr(img, "indirect_reference", None)
+        return reference.get_object() if reference is not None else None
+    except Exception:
+        return None
+
+
+def _is_masked(stream) -> bool:
+    """True when the PDF itself gives this image a transparency mask.
+
+    A signature or logo placed by Sign PDF or Watermark PDF arrives as an image
+    plus an /SMask holding its alpha channel. Re-encoding the image as JPEG
+    throws the mask away, which is what turned a signature into a solid box.
+    """
+    if stream is None:
+        return False
+    for key in ("/SMask", "/Mask"):
+        try:
+            if key in stream and stream.get(key) is not None:
+                return True
+        except Exception:
+            # An unreadable dictionary is treated as masked, so the image is
+            # left alone rather than risked.
+            return True
+    return False
+
+
+def _keep_as_is(img, stream) -> bool:
+    """True when an image must be copied across untouched.
+
+    Checked before the image is decoded where possible, so a skipped image
+    costs nothing.
+    """
+    if _is_masked(stream):
+        return True
+    try:
+        pil_img = img.image
+    except Exception:
+        return True
+    if pil_img.mode in TRANSPARENT_MODES or pil_img.mode in NO_RECODE_MODES:
+        return True
+    # A palette or grayscale image can carry transparency in its own metadata.
+    if "transparency" in getattr(pil_img, "info", {}):
+        return True
+    return False
+
+
 def task_compress(job_dir: str, params: dict) -> dict:
     from PIL import Image
     from pypdf import PdfReader, PdfWriter
@@ -281,8 +338,14 @@ def task_compress(job_dir: str, params: dict) -> dict:
     for page in writer.pages:
         for img in page.images:
             try:
+                # An image with transparency, or one in CMYK, is left exactly
+                # as it is. JPEG cannot hold an alpha channel, so re-encoding a
+                # signature or a logo would flatten it to a solid box, and a
+                # CMYK round trip shifts the colours.
+                if _keep_as_is(img, _image_stream(img)):
+                    continue
                 pil_img = img.image
-                if pil_img.mode in ("RGBA", "P", "CMYK"):
+                if pil_img.mode == "P":
                     pil_img = pil_img.convert("RGB")
                 if scale_factor < 1.0:
                     width, height = pil_img.size
