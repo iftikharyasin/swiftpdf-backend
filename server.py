@@ -31,6 +31,19 @@ PDF to Word, 9 November 2026
     is retried with today's settings. So the new page can be tested against
     this backend with no risk to the live page.
 
+PDF to Word time budget, 10 November 2026
+    pdf2docx needs roughly 3 to 4 seconds a page on the free tier's 0.1 CPU,
+    so the old 180 second limit never fitted a long file. /api/convert now has
+    its own limit, OPTIMAX_CONVERT_TIMEOUT, 300 seconds by default. No other
+    tool's timeout changed.
+    The worker is told how much of that time is left and spends it in order:
+    the conversion first, then the safer retry only if there is room, then the
+    page fit check only on a short file and only while the time lasts. Once
+    the repaired file is written the worker marks it ready, and from then on a
+    job that runs out of time answers with that file instead of an error.
+    Only if nothing finished does the reply become an error, and then it
+    suggests a page range.
+
 Start the API:   uvicorn server:app --host 0.0.0.0 --port 10000
 Child process:   python server.py --worker <task> <job_dir>   (started by the API)
 
@@ -118,21 +131,41 @@ MAX_PAGES_OCR = _env_int("OPTIMAX_MAX_PAGES_OCR", 50)
 MAX_PAGES_PDF_TO_WORD = _env_int("OPTIMAX_MAX_PAGES_PDF_TO_WORD", 150)
 MAX_PAGES_PDF_TO_EXCEL_OCR = _env_int("OPTIMAX_MAX_PAGES_PDF_TO_EXCEL_OCR", 50)
 
-# PDF to Word, new modes only. None of these touch the old page.
-#   RENDER_CHECK  render the DOCX back through LibreOffice and tighten the
-#                 spacing if the page count grew. Off on the free tier: two
-#                 renders can cost more memory than a 512 MB instance has.
-#   TEXT_RECALL   share of the PDF's words that must survive into the DOCX
-#                 before the conversion is retried with safer settings.
+# PDF to Word. None of these touch any other tool.
+#   TIMEOUT          how long a conversion may take. pdf2docx needs roughly 3
+#                    to 4 seconds a page on the free tier's 0.1 CPU, so the old
+#                    180 seconds never fitted a long file. Only /api/convert
+#                    uses it.
+#   SOFT_PAGES       above this the page warns, before any upload, that the
+#                    file will take a few minutes and offers a page range. It
+#                    blocks nothing. /health reports it so the page and the
+#                    server cannot drift apart.
+#   RENDER_CHECK     render the DOCX back through LibreOffice and tighten the
+#                    spacing if the page count grew. Off on the free tier: two
+#                    renders can cost more memory than a 512 MB instance has.
+#   RENDER_MAX_PAGES the render check only runs at or below this page count.
+#                    A render costs about as long as the conversion did, so on
+#                    a long file it would eat the whole budget for a page or
+#                    two of tidier layout.
+#   TEXT_RECALL      share of the PDF's words that must survive into the DOCX
+#                    before the conversion is retried with safer settings.
+#   BUDGET_MARGIN    seconds held back from the job's time, so a finished file
+#                    can always be written and sent.
+CONVERT_TIMEOUT = max(30, _env_int("OPTIMAX_CONVERT_TIMEOUT", 300))
+CONVERT_SOFT_PAGES = max(0, _env_int("OPTIMAX_CONVERT_SOFT_PAGES", 40))
 CONVERT_RENDER_CHECK = _env_flag("OPTIMAX_CONVERT_RENDER_CHECK", False)
+CONVERT_RENDER_MAX_PAGES = max(0, _env_int("OPTIMAX_CONVERT_RENDER_MAX_PAGES", 12))
 CONVERT_RENDER_TIMEOUT = max(10, _env_int("OPTIMAX_CONVERT_RENDER_TIMEOUT", 60))
 CONVERT_TEXT_RECALL_MIN = _env_float("OPTIMAX_CONVERT_TEXT_RECALL_MIN", 0.90)
+CONVERT_BUDGET_MARGIN = max(5.0, _env_float("OPTIMAX_CONVERT_BUDGET_MARGIN", 15.0))
 
 # Size limit (MB) and timeout (seconds) per endpoint. The size limits must
 # match the numbers the pages show (TOOLS.md section 3). Timeouts follow the
 # targets in TOOLS.md section 3.1.
 TOOL_LIMITS = {
-    "/api/convert": (15, 180),
+    # PDF to Word is the only tool with a longer limit. Every other number
+    # here is unchanged.
+    "/api/convert": (15, CONVERT_TIMEOUT),
     "/api/word-to-pdf": (20, 120),
     "/api/compress": (50, 120),
     "/api/protect": (30, 60),
@@ -174,6 +207,7 @@ MESSAGES = {
     "bad_pages": "We could not read that page range. Use numbers like 1-3, 5.",
     "busy": "Our server is working on another file. Please try again in a few seconds.",
     "timeout": "This file took too long to process. Try a smaller file or fewer pages.",
+    "timeout_pages": "This file took too long. Long files can take a few minutes on our free server. Try converting a page range, such as 1-20.",
     "server_memory": "This file needed more memory than our server has. Try a smaller file or fewer pages.",
     "rate_limited": "You have sent many files in a short time. Please wait a few minutes and try again.",
     "forbidden_origin": "Requests from this website are not allowed.",
@@ -330,6 +364,32 @@ LEGACY_SETTINGS = {
     "multi_processing": False,
     "page_layout_analysis": True,
 }
+
+
+class _Budget:
+    """How much of the job's time is left inside the worker.
+
+    The API sends the seconds it had left when it started this child, and the
+    child counts from its own start. The margin is held back so a finished
+    file can always be written, marked ready and sent before the parent's
+    timeout fires.
+
+    With no budget given, every check passes, which is what the old page and
+    any direct call get.
+    """
+
+    def __init__(self, seconds: float, margin: float = CONVERT_BUDGET_MARGIN):
+        self.start = time.monotonic()
+        self.total = float(seconds or 0)
+        self.margin = margin
+
+    def left(self) -> float:
+        if self.total <= 0:
+            return float("inf")
+        return self.total - (time.monotonic() - self.start) - self.margin
+
+    def have(self, needed: float) -> bool:
+        return self.left() >= max(0.0, needed)
 
 
 def _known_settings() -> set:
@@ -634,22 +694,49 @@ def _tighten(src: str, dst: str, line_scale: float, before_scale: float) -> None
     document.save(dst)
 
 
-def _fit_pages(job_dir: str, docx_path: str, target_pages: int, notes: list) -> str:
-    """Stage D, the expensive half. Off unless OPTIMAX_CONVERT_RENDER_CHECK."""
+def _fit_pages(job_dir: str, docx_path: str, target_pages: int, notes: list,
+               budget: "_Budget", render_estimate: float) -> str:
+    """Stage D, the expensive half. Off unless OPTIMAX_CONVERT_RENDER_CHECK.
+
+    Each render is a LibreOffice run that costs about as long as the
+    conversion did, so none is started without the time for it, and each one
+    is capped by the time actually left. Running out mid way is not a failure:
+    the file written before this step is already the result.
+    """
     work = os.path.join(job_dir, "fit")
-    rendered = _render_pdf(docx_path, os.path.join(work, "r0"), CONVERT_RENDER_TIMEOUT)
+
+    def render(path, folder):
+        allowance = min(CONVERT_RENDER_TIMEOUT, max(0.0, budget.left()))
+        if allowance < 5:
+            return None, True
+        return _render_pdf(path, os.path.join(work, folder), int(allowance)), False
+
+    if not budget.have(render_estimate):
+        notes.append("fit_skipped_time")
+        return docx_path
+
+    rendered, out_of_time = render(docx_path, "r0")
+    if out_of_time:
+        notes.append("fit_skipped_time")
+        return docx_path
     pages = _page_count(rendered) if rendered else 0
     if not pages or not target_pages or pages <= target_pages:
         return docx_path
 
     best, best_pages = docx_path, pages
     for index, (line_scale, before_scale) in enumerate(((0.97, 0.85), (0.94, 0.70)), start=1):
+        if not budget.have(render_estimate):
+            notes.append("fit_stopped_time")
+            break
         candidate = os.path.join(work, f"try{index}.docx")
         try:
             _tighten(docx_path, candidate, line_scale, before_scale)
         except Exception:
             break
-        rendered = _render_pdf(candidate, os.path.join(work, f"r{index}"), CONVERT_RENDER_TIMEOUT)
+        rendered, out_of_time = render(candidate, f"r{index}")
+        if out_of_time:
+            notes.append("fit_stopped_time")
+            break
         got = _page_count(rendered) if rendered else 0
         if got and got < best_pages:
             best, best_pages = candidate, got
@@ -657,6 +744,47 @@ def _fit_pages(job_dir: str, docx_path: str, target_pages: int, notes: list) -> 
         if best_pages <= target_pages:
             break
     return best
+
+
+READY_MARKER = "output.ready"
+
+
+def _mark_ready(job_dir: str, engine: str, notes: list) -> None:
+    """Record that output.docx is a finished file worth sending.
+
+    After this, the parent may answer with the file even if the job is killed
+    for running out of time. Written through a temporary name, so a half
+    written marker is never read.
+    """
+    payload = {"engine": engine, "notes": ",".join(sorted(set(notes)))}
+    tmp = os.path.join(job_dir, READY_MARKER + ".tmp")
+    try:
+        with open(tmp, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle)
+        os.replace(tmp, os.path.join(job_dir, READY_MARKER))
+    except OSError:
+        pass
+
+
+def read_ready_result(job_dir: str) -> dict | None:
+    """A finished file the worker marked ready, or None.
+
+    Used by the parent when a job runs out of time. Only PDF to Word writes
+    the marker, so every other tool gets None and behaves exactly as before.
+    """
+    marker = os.path.join(job_dir, READY_MARKER)
+    output = os.path.join(job_dir, "output.docx")
+    try:
+        if not os.path.exists(marker) or os.path.getsize(output) == 0:
+            return None
+        with open(marker, encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (OSError, ValueError):
+        return None
+    notes = [note for note in str(payload.get("notes") or "").split(",") if note]
+    notes.append("fit_skipped_time")
+    return {"ok": True, "engine": payload.get("engine") or "tuned",
+            "notes": ",".join(sorted(set(notes)))}
 
 
 def convert_with_repair(job_dir: str, mode: str, params: dict) -> dict:
@@ -667,16 +795,20 @@ def convert_with_repair(job_dir: str, mode: str, params: dict) -> dict:
     out = os.path.join(job_dir, "output.docx")
     raw = os.path.join(job_dir, "raw.docx")
     notes: list[str] = []
+    budget = _Budget(params.get("budget") or 0)
 
     page_count = _check_pdf(src, 403)
     pages = parse_page_range(params.get("pages") or "", page_count)
-    _check_page_cap(len(pages) if pages else page_count, int(params.get("max_pages") or 0))
+    selected = len(pages) if pages else page_count
+    _check_page_cap(selected, int(params.get("max_pages") or 0))
 
     page_words = _pdf_page_words(src, pages)
     if not any(len(words) >= 5 for words in page_words):
         raise ApiError(422, "no_text")
 
+    started = time.monotonic()
     engine = _convert_once(src, raw, TUNED_SETTINGS, pages, notes)
+    convert_seconds = time.monotonic() - started
 
     try:
         _fill_empty_pages(raw, page_words, notes, pages)
@@ -692,17 +824,23 @@ def convert_with_repair(job_dir: str, mode: str, params: dict) -> dict:
     except Exception:
         recall = 1.0
     if engine == "tuned" and recall < CONVERT_TEXT_RECALL_MIN:
-        notes.append("retried_safer")
-        retry = os.path.join(job_dir, "retry.docx")
-        try:
-            _convert_once(src, retry, SAFER_SETTINGS, pages, [])
-            if _text_recall(page_words, retry) > recall:
-                shutil.copyfile(retry, raw)
-                engine = "safer"
-        except MemoryError:
-            raise
-        except Exception:
-            pass
+        # A second conversion costs about what the first one did. On a long
+        # file there is no room for it, and a file with most of its text is
+        # worth more than a timeout.
+        if not budget.have(convert_seconds):
+            notes.append("retry_skipped_time")
+        else:
+            notes.append("retried_safer")
+            retry = os.path.join(job_dir, "retry.docx")
+            try:
+                _convert_once(src, retry, SAFER_SETTINGS, pages, [])
+                if _text_recall(page_words, retry) > recall:
+                    shutil.copyfile(retry, raw)
+                    engine = "safer"
+            except MemoryError:
+                raise
+            except Exception:
+                pass
 
     repair_mode = "flow" if mode == "editable" else "layout"
     try:
@@ -723,15 +861,31 @@ def convert_with_repair(job_dir: str, mode: str, params: dict) -> dict:
     if report.get("markers_removed"):
         notes.append("markers_removed")
 
+    # From here the job has a file worth sending. Anything after this is
+    # polish, and the parent may answer with this file if time runs out.
+    _require_output(out)
+    _mark_ready(job_dir, engine, notes)
+
     if CONVERT_RENDER_CHECK and mode == "layout":
-        try:
-            best = _fit_pages(job_dir, out, len(page_words), notes)
-            if best != out:
-                shutil.copyfile(best, out)
-        except MemoryError:
-            raise
-        except Exception:
-            pass
+        if CONVERT_RENDER_MAX_PAGES and selected > CONVERT_RENDER_MAX_PAGES:
+            notes.append("fit_skipped_pages")
+        else:
+            # A LibreOffice render costs roughly what the conversion did, with
+            # a floor for a very quick one.
+            render_estimate = max(15.0, convert_seconds * 0.8)
+            try:
+                best = _fit_pages(job_dir, out, len(page_words), notes, budget, render_estimate)
+                if best != out:
+                    # Replace in one step, so a kill cannot leave a half
+                    # written output.docx behind the ready marker.
+                    staged = out + ".fit"
+                    shutil.copyfile(best, staged)
+                    os.replace(staged, out)
+            except MemoryError:
+                raise
+            except Exception:
+                pass
+        _mark_ready(job_dir, engine, notes)
 
     _require_output(out)
     return {"engine": engine, "notes": ",".join(sorted(set(notes)))}
@@ -1365,17 +1519,31 @@ class Job:
             raise ApiError(422, "timeout")
         return remaining
 
+    def budget(self) -> float:
+        """Seconds left before this job's deadline, never below zero."""
+        return max(0.0, self.deadline - time.monotonic())
+
     def run_worker(self, task: str, params: dict) -> dict:
         result_path = os.path.join(self.dir, "result.json")
         if os.path.exists(result_path):
             os.remove(result_path)
 
-        returncode = run_child(
-            [sys.executable, WORKER_FILE, "--worker", task, self.dir],
-            self._remaining(),
-            cwd=self.dir,
-            stdin_bytes=json.dumps(params).encode("utf-8"),
-        )
+        try:
+            returncode = run_child(
+                [sys.executable, WORKER_FILE, "--worker", task, self.dir],
+                self._remaining(),
+                cwd=self.dir,
+                stdin_bytes=json.dumps(params).encode("utf-8"),
+            )
+        except ApiError as err:
+            # Out of time. If the worker had already finished a file and said
+            # so, send that rather than an error. Nothing finished is lost.
+            if err.code == "timeout":
+                ready = read_ready_result(self.dir)
+                if ready is not None:
+                    log.info("job=%s tool=%s recovered a ready file after timeout", self.id, self.tool)
+                    return ready
+            raise
 
         try:
             with open(result_path, encoding="utf-8") as handle:
@@ -1625,8 +1793,10 @@ class RequestGuardMiddleware:
 async def lifespan(_app):
     startup_cleanup()
     log.info(
-        "start max_jobs=%d max_waiting=%d timeout_factor=%.2f render_check=%s origins=%s",
-        MAX_JOBS, MAX_WAITING, TIMEOUT_FACTOR, CONVERT_RENDER_CHECK, ",".join(ALLOWED_ORIGINS),
+        "start max_jobs=%d max_waiting=%d timeout_factor=%.2f convert_timeout=%d "
+        "convert_soft_pages=%d render_check=%s render_max_pages=%d origins=%s",
+        MAX_JOBS, MAX_WAITING, TIMEOUT_FACTOR, CONVERT_TIMEOUT, CONVERT_SOFT_PAGES,
+        CONVERT_RENDER_CHECK, CONVERT_RENDER_MAX_PAGES, ",".join(ALLOWED_ORIGINS),
     )
     yield
 
@@ -1678,14 +1848,25 @@ def convert_pdf(
 
     with Job("/api/convert", file) as job:
         job.start(".pdf")
-        result = job.run_worker(
-            "pdf_to_word",
-            {
-                "max_pages": MAX_PAGES_PDF_TO_WORD,
-                "mode": chosen,
-                "pages": pages if chosen else "",
-            },
-        )
+        try:
+            result = job.run_worker(
+                "pdf_to_word",
+                {
+                    "max_pages": MAX_PAGES_PDF_TO_WORD,
+                    "mode": chosen,
+                    "pages": pages if chosen else "",
+                    # What the worker has to work with. It holds back a margin
+                    # of its own so a finished file can still be sent.
+                    "budget": job.budget() if chosen else 0,
+                },
+            )
+        except ApiError as err:
+            # Nothing finished, and the time ran out. Point at the page range
+            # rather than only "try a smaller file". The old page keeps the
+            # old code and the old wording.
+            if chosen and err.code == "timeout":
+                raise ApiError(422, "timeout_pages") from None
+            raise
         if not chosen:
             return job.file_response("output.docx", DOCX_TYPE, f"OptimaxPDF_Converted_{job.base}.docx")
 
@@ -1786,7 +1967,10 @@ async def health_check():
 @app.get("/health")
 async def health():
     # Light check for the wake up state on tool pages. Never waits on a job.
-    return {"status": "ok"}
+    # convert_soft_pages is the page count above which PDF to Word warns that
+    # a file will take a few minutes. The page keeps its own default in
+    # config.js and prefers this value when it has it, so the two cannot drift.
+    return {"status": "ok", "convert_soft_pages": CONVERT_SOFT_PAGES}
 
 
 if __name__ == "__main__":
