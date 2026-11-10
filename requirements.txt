@@ -1,6 +1,7 @@
-# One addition for the PDF to Word rebuild: python-docx, which docx_repair.py
-# imports directly. pdf2docx already pulls it in, so nothing new is downloaded,
-# but a package we import by name should be listed by name.
+# python-docx and pymupdf are both pulled in by pdf2docx, so nothing new is
+# downloaded by naming them. They are listed because server.py, docx_repair.py
+# and pdf_prepare.py import them directly, and a package we import by name
+# should be a package we ask for by name.
 # Pinning the rest (cryptography, pillow, ocrmypdf, pikepdf, pdfplumber,
 # pandas, openpyxl) happens in the Backend upgrade step with Python 3.12
 # (AUDIT.md 6.11), after testing a full build.
@@ -9,6 +10,7 @@ uvicorn==0.28.0
 python-multipart==0.0.9
 pdf2docx==0.5.6
 python-docx
+pymupdf
 pypdf==4.2.0
 cryptography
 pillow

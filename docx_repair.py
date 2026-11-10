@@ -308,6 +308,42 @@ def fix_image_paragraphs(doc, report, space_before_pt=6.0) -> None:
 
 
 # ---------------------------------------------------------------------------
+# 10 November. Publisher tags that were never meant to be read
+# ---------------------------------------------------------------------------
+
+# Springer writes these as invisible text beside each equation so that its own
+# tooling can find them. pdf_prepare.py takes them out of the PDF before
+# pdf2docx runs; this is the safety net for a file that skipped that step, or
+# for another publisher's spelling of the same idea.
+EQ_TOKEN = re.compile(
+    r"\b(?:display|inline)[-_]?eq[-_]?(?:Equ?|Eq)?\d*\b|\bEqu\d+\b(?=\s*$)",
+    re.IGNORECASE,
+)
+
+
+def drop_eq_tokens(doc, report) -> None:
+    """Remove publisher equation tags that came through as text."""
+    for paragraph in list(doc.paragraphs):
+        if not paragraph.runs:
+            continue
+        whole = "".join(run.text for run in paragraph.runs)
+        if not EQ_TOKEN.search(whole):
+            continue
+        for run in paragraph.runs:
+            if not run.text:
+                continue
+            cleaned = EQ_TOKEN.sub("", run.text)
+            if cleaned != run.text:
+                report["eq_tokens_removed"] += 1
+                run.text = re.sub(r"[ \t]{2,}", " ", cleaned)
+        # A paragraph that held nothing but tags is now empty furniture.
+        if not paragraph.text.strip() and not has_drawing(paragraph._element):
+            parent = paragraph._element.getparent()
+            if parent is not None:
+                parent.remove(paragraph._element)
+
+
+# ---------------------------------------------------------------------------
 # Fault 5. Logo and marker runs
 # ---------------------------------------------------------------------------
 
@@ -372,29 +408,91 @@ def section_paragraphs(doc):
     return groups
 
 
-def _classify_running(lines):
+MIN_RUNNING_SHARE = 0.30
+
+
+def _needed(slots: int, share: float = MIN_RUNNING_SHARE) -> int:
+    """How many pages a line must appear on before it counts as a running one."""
+    return max(2, -(-int(slots) * int(share * 100) // 100))
+
+
+def _classify_running(lines, share: float = MIN_RUNNING_SHARE):
     """Decide whether a repeated line is the same on every page or alternates.
 
     Returns (kind, odd_text, even_text) where kind is "none", "same" or
     "alternating". Page 1 counts as odd, which is what Word means by the
     default header.
+
+    Judged by the share of pages a line covers, not by an all or nothing test.
+    The 10 November test file showed why both halves of that matter:
+
+      Too strict. A journal article's first page carries the banner and the
+      title block, not a running head, so the odd pages hold two different
+      first lines. The old test demanded exactly one, gave up, and left the
+      head in the body on 17 of 35 pages.
+
+      Too loose. After the publisher's logo lines were blanked, only two
+      pages had a bottom line left, both the title head. Two out of 35 was
+      enough for the old "same" branch, so the head was written into the
+      footer of every page while the header stayed empty.
+
+    A line now has to cover at least `share` of the pages it could appear on,
+    and never fewer than two.
     """
     present = [text for text in lines if text]
-    if len(present) < 2:
+    total = len(lines)
+    if total < 2 or len(present) < 2:
         return "none", None, None
+
+    odd_lines = [lines[index] for index in range(0, total, 2)]
+    even_lines = [lines[index] for index in range(1, total, 2)]
+    odd_counts = Counter(text for text in odd_lines if text)
+    even_counts = Counter(text for text in even_lines if text)
+
+    odd_top, odd_hits = odd_counts.most_common(1)[0] if odd_counts else (None, 0)
+    even_top, even_hits = even_counts.most_common(1)[0] if even_counts else (None, 0)
+
+    # Left and right pages carrying different heads, which is what a journal
+    # article does. Checked first, so a file that alternates is never flattened
+    # into one head for every page.
+    if (odd_top and even_top and odd_top != even_top
+            and odd_hits >= _needed(len(odd_lines), share)
+            and even_hits >= _needed(len(even_lines), share)):
+        return "alternating", odd_top, even_top
 
     counts = Counter(present)
     most_common, hits = counts.most_common(1)[0]
-    if hits == len(lines) and len(counts) == 1:
-        return "same", most_common, None
-
-    odd = {text for index, text in enumerate(lines) if index % 2 == 0 and text}
-    even = {text for index, text in enumerate(lines) if index % 2 == 1 and text}
-    if len(odd) == 1 and len(even) == 1 and odd != even:
-        return "alternating", odd.pop(), even.pop()
-    if len(counts) == 1 and hits >= 2:
+    if hits >= _needed(total, share):
         return "same", most_common, None
     return "none", None, None
+
+
+# A caption is the thing most likely to sit at the bottom of a page and look
+# repeated, especially in a file made by merging the same pages twice.
+CAPTION_START = re.compile(
+    r"^\s*(fig(?:ure)?|tab(?:le)?|chart|scheme|exhibit|plate|box|appendix|source|notes?)"
+    r"\b[\s:.]*\d*[\s:.]",
+    re.IGNORECASE,
+)
+
+
+def _is_caption(text: str) -> bool:
+    """True when a line opens with a caption or source label."""
+    return bool(CAPTION_START.match(str(text or "")))
+
+
+def _is_sentencey(text: str) -> bool:
+    """True when a line reads like running prose rather than page furniture.
+
+    Six words or more, at least half of them four letters or longer. A journal
+    name, an author line and a page number all fall short of that; a sentence
+    does not.
+    """
+    words = str(text or "").split()
+    if len(words) < 6:
+        return False
+    long_words = sum(1 for word in words if len(re.sub(r"[^A-Za-z]", "", word)) >= 4)
+    return long_words / len(words) >= 0.5
 
 
 def _set_part_text(part, text, alignment):
@@ -418,15 +516,14 @@ def lift_running_text(doc, report, max_len=140):
 
     Returns the extra top and bottom space each section needs.
     """
-    groups = section_paragraphs(doc)
-    if not groups:
-        return {}
-
-    tops, bottoms = [], []
-    for group in groups:
-        filled = [p for p in group if p.text.strip()]
-        tops.append(filled[0] if filled else None)
-        bottoms.append(filled[-1] if filled else None)
+    def edges():
+        """First and last paragraph with words on it, per section, now."""
+        tops, bottoms = [], []
+        for group in section_paragraphs(doc):
+            filled = [p for p in group if p.text.strip()]
+            tops.append(filled[0] if filled else None)
+            bottoms.append(filled[-1] if filled else None)
+        return tops, bottoms
 
     def text_of(paragraph):
         if paragraph is None:
@@ -434,23 +531,57 @@ def lift_running_text(doc, report, max_len=140):
         text = paragraph.text.strip()
         return text if 0 < len(text) <= max_len else ""
 
-    top_lines = [text_of(p) for p in tops]
-    bottom_lines = [text_of(p) for p in bottoms]
+    tops, bottoms = edges()
+    if not tops:
+        return {}
 
     # A repeated line with no words in it is page furniture, not a running
     # head. The "1 3" that the Springer logo leaves behind is removed here.
-    for lines, candidates in ((top_lines, tops), (bottom_lines, bottoms)):
+    #
+    # The edges are deliberately not read again afterwards. Taking the logo
+    # away uncovers whatever sat above it, which on this article is the figure
+    # caption, and a caption that repeats is not a running foot. The sparse
+    # bottom list that the logo leaves behind is handled by the support
+    # threshold in `_classify_running`, which is what the 10 November footer
+    # bug actually needed.
+    for candidates in (tops, bottoms):
+        lines = [text_of(p) for p in candidates]
         repeated = {text for text, n in Counter(t for t in lines if t).items() if n >= 2}
         for index, text in enumerate(lines):
             if text and text in repeated and not re.search(r"[A-Za-z]{2,}", text):
                 paragraph = candidates[index]
+                if paragraph is None or paragraph._element.getparent() is None:
+                    continue
                 report["markers_removed"].append({"text": text, "fonts": ["repeated marker"]})
                 paragraph._element.getparent().remove(paragraph._element)
                 candidates[index] = None
-                lines[index] = ""
+
+    top_lines = [text_of(p) for p in tops]
+    bottom_lines = [text_of(p) for p in bottoms]
 
     head_kind, head_odd, head_even = _classify_running(top_lines)
     foot_kind, foot_odd, foot_even = _classify_running(bottom_lines)
+
+    # A line is a head or a foot, never both. The top wins, because that is
+    # where a running head belongs and where it was read from.
+    head_texts = {text for text in (head_odd, head_even) if text}
+    if foot_kind != "none" and head_texts:
+        foot_texts = {text for text in (foot_odd, foot_even) if text}
+        if foot_texts & head_texts:
+            report["footer_rejected"] = sorted(foot_texts & head_texts)
+            foot_kind, foot_odd, foot_even = "none", None, None
+
+    # A running foot is page furniture: a number, a journal line, a notice. A
+    # sentence at the bottom of a page is a caption or the end of a paragraph,
+    # and on a short document two of them can look alike. Prose needs three
+    # pages of evidence before it is believed.
+    if foot_kind != "none":
+        candidates_text = [text for text in (foot_odd, foot_even) if text]
+        counts = Counter(text for text in bottom_lines if text)
+        if any(_is_caption(text) or (_is_sentencey(text) and counts.get(text, 0) < 3)
+               for text in candidates_text):
+            report["footer_rejected"] = sorted(set(report["footer_rejected"]) | set(candidates_text))
+            foot_kind, foot_odd, foot_even = "none", None, None
 
     if head_kind == "none" and foot_kind == "none":
         return {}
@@ -496,14 +627,20 @@ def lift_running_text(doc, report, max_len=140):
             except (AttributeError, ValueError):
                 pass
 
-    # Now remove the lines from the body and record the room they need.
+    # Now take the lines out of the body, but only from the pages that really
+    # carry them. A first page with a banner instead of a running head keeps
+    # its banner.
+    foot_texts = {text for text in (foot_odd, foot_even) if text}
     for index, (top, bottom) in enumerate(zip(tops, bottoms)):
-        if head_kind != "none" and top is not None and top_lines[index]:
+        if (head_kind != "none" and top is not None
+                and top_lines[index] in head_texts
+                and top._element.getparent() is not None):
             extra.setdefault(index, {})["header"] = line_height(top)
             top._element.getparent().remove(top._element)
             report["lines_lifted"] += 1
-        if foot_kind != "none" and bottom is not None and bottom_lines[index] \
-                and bottom is not top:
+        if (foot_kind != "none" and bottom is not None and bottom is not top
+                and bottom_lines[index] in foot_texts
+                and bottom._element.getparent() is not None):
             extra.setdefault(index, {})["footer"] = line_height(bottom)
             bottom._element.getparent().remove(bottom._element)
             report["lines_lifted"] += 1
@@ -744,7 +881,9 @@ def new_report() -> dict:
         "markers_removed": [],
         "headers": {},
         "footers": {},
+        "footer_rejected": [],
         "lines_lifted": 0,
+        "eq_tokens_removed": 0,
         "hyphens_joined": [],
         "hyphens_kept": [],
         "breaks_removed": 0,
@@ -770,6 +909,7 @@ def repair(in_path: str, out_path: str, mode: str = "flow") -> dict:
 
     fix_columns(document, report)
     fix_image_paragraphs(document, report)
+    drop_eq_tokens(document, report)
     drop_marker_runs(document, report)
     extra = lift_running_text(document, report)
     rejoin_hyphens(document, report)

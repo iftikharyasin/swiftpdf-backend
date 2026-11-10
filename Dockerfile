@@ -55,6 +55,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY server.py .
 COPY docx_repair.py .
+COPY pdf_prepare.py .
 
 # tini runs first so killed jobs never leave zombie processes behind.
 ENTRYPOINT ["/usr/bin/tini", "--"]

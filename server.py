@@ -152,7 +152,17 @@ MAX_PAGES_PDF_TO_EXCEL_OCR = _env_int("OPTIMAX_MAX_PAGES_PDF_TO_EXCEL_OCR", 50)
 #   BUDGET_MARGIN    seconds held back from the job's time, so a finished file
 #                    can always be written and sent.
 CONVERT_TIMEOUT = max(30, _env_int("OPTIMAX_CONVERT_TIMEOUT", 300))
-CONVERT_SOFT_PAGES = max(0, _env_int("OPTIMAX_CONVERT_SOFT_PAGES", 40))
+# Lowered from 40 on 10 November: 35 pages measured 294 seconds on the free
+# tier, so 40 was never honest advice.
+CONVERT_SOFT_PAGES = max(0, _env_int("OPTIMAX_CONVERT_SOFT_PAGES", 25))
+# Clean the PDF before pdf2docx sees it: invisible publisher tags out, display
+# equations turned into pictures. See pdf_prepare.py.
+CONVERT_PREPARE = _env_flag("OPTIMAX_CONVERT_PREPARE", True)
+# pdf2docx finds a table either from ruled lines (lattice) or from how the text
+# lines up (stream). Stream parsing is the slower of the two and the one that
+# turns an equation into a table. Set this to false to try a faster run, and
+# check the real results tables still arrive as tables.
+CONVERT_STREAM_TABLES = _env_flag("OPTIMAX_CONVERT_STREAM_TABLES", True)
 CONVERT_RENDER_CHECK = _env_flag("OPTIMAX_CONVERT_RENDER_CHECK", False)
 CONVERT_RENDER_MAX_PAGES = max(0, _env_int("OPTIMAX_CONVERT_RENDER_MAX_PAGES", 12))
 CONVERT_RENDER_TIMEOUT = max(10, _env_int("OPTIMAX_CONVERT_RENDER_TIMEOUT", 60))
@@ -333,9 +343,13 @@ def _require_output(path: str) -> None:
 TUNED_SETTINGS = {
     # Fault 4 at the source, where the line ends are still known.
     "delete_end_line_hyphen": True,
-    # Never split a page into column sections. A value above any page height
-    # means the whole page is one section, which is where the bad <w:cols>
-    # came from.
+    # One section per page, so a page is never split into column sections.
+    # This is right for a single column paper and wrong for a two column one,
+    # where pdf2docx has to keep its own column logic to read the page in the
+    # right order. `_section_height_for` chooses, from what pdf_prepare saw.
+    # The overlapping columns of 9 November were a bug in how pdf2docx writes
+    # <w:cols>, which docx_repair.fix_columns repairs either way, so there is
+    # no need to disable column detection to avoid them.
     "min_section_height": 10000.0,
     "page_margin_factor_top": 0.0,
     "page_margin_factor_bottom": 0.0,
@@ -488,60 +502,115 @@ def _convert_once(src: str, out: str, settings: dict, pages: list[int] | None, n
     return "legacy"
 
 
-def _pdf_page_words(src: str, pages: list[int] | None) -> list[list[str]]:
-    """Words per page, used by the page check and the text check."""
+WORD_RE = re.compile(r"[^\W\d_]{2,}", re.UNICODE)
+
+
+def _read_pages(src: str, pages: list[int] | None) -> tuple[list[str], str]:
+    """Text of each selected page, in selection order, and the engine used.
+
+    PyMuPDF first, which is installed with pdf2docx and reads text several
+    times faster than pdfplumber. pdfplumber stays as the fallback, so a build
+    without PyMuPDF still works. One pass serves the page check, the text
+    recall check and the per page fallback, instead of opening the file twice.
+    """
+    try:
+        import fitz
+
+        texts: list[str] = []
+        with fitz.open(src) as doc:
+            wanted = range(doc.page_count) if pages is None else pages
+            for index in wanted:
+                if index >= doc.page_count:
+                    continue
+                try:
+                    texts.append(doc[index].get_text("text") or "")
+                except Exception:
+                    texts.append("")
+        return texts, "pymupdf"
+    except Exception:
+        pass
+
     import pdfplumber
 
-    out: list[list[str]] = []
+    texts = []
     with pdfplumber.open(src) as pdf:
         wanted = range(len(pdf.pages)) if pages is None else pages
         for index in wanted:
             if index >= len(pdf.pages):
                 continue
             try:
-                text = pdf.pages[index].extract_text() or ""
+                texts.append(pdf.pages[index].extract_text() or "")
             except Exception:
-                text = ""
-            out.append(re.findall(r"[^\W\d_]{2,}", text, flags=re.UNICODE))
-    return out
+                texts.append("")
+    return texts, "pdfplumber"
+
+
+def _words_of(texts: list[str]) -> list[list[str]]:
+    return [WORD_RE.findall(text) for text in texts]
+
+
+def _pdf_page_words(src: str, pages: list[int] | None) -> list[list[str]]:
+    """Words per page. Kept for callers that only need the words."""
+    texts, _ = _read_pages(src, pages)
+    return _words_of(texts)
 
 
 def _docx_sections_text(path: str) -> list[str]:
-    """Text per section. pdf2docx writes one section per converted page."""
+    """Text per section. pdf2docx writes one section per converted page.
+
+    Tables count. This used to walk only the `w:p` children of the body, so a
+    page whose text pdf2docx had put in a table looked empty, and
+    `_fill_empty_pages` added that text a second time as paragraphs. That is
+    where the duplicated sentences on the equation pages came from: those were
+    exactly the pages that became tables.
+    """
     from docx import Document
     from docx.oxml.ns import qn
+    from docx.table import Table
     from docx.text.paragraph import Paragraph
 
     document = Document(path)
     chunks, current = [], []
+
+    def close():
+        chunks.append("\n".join(current))
+        current.clear()
+
     for child in document.element.body.iterchildren():
         tag = child.tag.split("}")[1]
         if tag == "p":
             current.append(Paragraph(child, document).text)
             ppr = child.find(qn("w:pPr"))
             if ppr is not None and ppr.find(qn("w:sectPr")) is not None:
-                chunks.append("\n".join(current))
-                current = []
+                close()
+        elif tag == "tbl":
+            table = Table(child, document)
+            for row in table.rows:
+                for cell in row.cells:
+                    current.append(cell.text)
         elif tag == "sectPr":
-            chunks.append("\n".join(current))
-            current = []
+            close()
     if current:
-        chunks.append("\n".join(current))
+        close()
     return chunks
 
 
 def _fill_empty_pages(path: str, page_words: list[list[str]], notes: list,
-                      pages: list[int] | None = None) -> None:
+                      pages: list[int] | None = None,
+                      page_texts: list[str] | None = None) -> None:
     """Stage C. No page may come back empty when the PDF page has text.
 
     Images and layout cannot be recovered here, but the text is not lost. The
-    page gets the words pdfplumber reads, in reading order, as plain
+    page gets the text read from the PDF, in reading order, as plain
     paragraphs.
+
+    Two guards against adding text that is already there: the section text now
+    counts table cells, and any line already present in the section is
+    skipped.
     """
     from docx import Document
     from docx.oxml.ns import qn
     from docx.text.paragraph import Paragraph
-    import pdfplumber
 
     sections = _docx_sections_text(path)
     missing = [
@@ -560,26 +629,31 @@ def _fill_empty_pages(path: str, page_words: list[list[str]], notes: list,
         if ppr is not None and ppr.find(qn("w:sectPr")) is not None:
             closers.append(child)
 
-    source = os.path.join(os.path.dirname(path), "input.pdf")
+    if page_texts is None:
+        source = os.path.join(os.path.dirname(path), "input.pdf")
+        page_texts, _ = _read_pages(source, pages)
+
     recovered = 0
-    with pdfplumber.open(source) as pdf:
-        for index in missing:
-            # `index` is the position in the selection. With a page range the
-            # real page is pages[index]; without one the two are the same.
-            real = pages[index] if pages else index
-            if index >= len(closers) or real >= len(pdf.pages):
-                continue
-            try:
-                text = pdf.pages[real].extract_text() or ""
-            except Exception:
-                text = ""
-            if not text.strip():
-                continue
-            anchor = Paragraph(closers[index], document)
-            for line in reversed([line for line in text.splitlines() if line.strip()]):
-                new = anchor.insert_paragraph_before(line.strip())
-                new.style = anchor.style
-            recovered += 1
+    for index in missing:
+        # `index` is the position in the selection, which is also the section
+        # number. page_texts is in the same order.
+        if index >= len(closers) or index >= len(page_texts):
+            continue
+        text = page_texts[index] or ""
+        if not text.strip():
+            continue
+        already = " ".join((sections[index] or "").split())
+        anchor = Paragraph(closers[index], document)
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        # Never put back a line the page already shows, whether it is in a
+        # paragraph or in a table cell.
+        lines = [line for line in lines if " ".join(line.split()) not in already]
+        if not lines:
+            continue
+        for line in reversed(lines):
+            new = anchor.insert_paragraph_before(line)
+            new.style = anchor.style
+        recovered += 1
     if recovered:
         document.save(path)
         notes.append("page_text_recovered")
@@ -797,32 +871,87 @@ def convert_with_repair(job_dir: str, mode: str, params: dict) -> dict:
     notes: list[str] = []
     budget = _Budget(params.get("budget") or 0)
 
+    timings: dict[str, float] = {}
+
+    def stage(name):
+        class _Timer:
+            def __enter__(self):
+                self.start = time.monotonic()
+                return self
+
+            def __exit__(self, *_):
+                timings[name] = round(time.monotonic() - self.start, 1)
+                return False
+
+        return _Timer()
+
     page_count = _check_pdf(src, 403)
     pages = parse_page_range(params.get("pages") or "", page_count)
     selected = len(pages) if pages else page_count
     _check_page_cap(selected, int(params.get("max_pages") or 0))
 
-    page_words = _pdf_page_words(src, pages)
+    with stage("read"):
+        page_texts, text_engine = _read_pages(src, pages)
+        page_words = _words_of(page_texts)
     if not any(len(words) >= 5 for words in page_words):
         raise ApiError(422, "no_text")
 
-    started = time.monotonic()
-    engine = _convert_once(src, raw, TUNED_SETTINGS, pages, notes)
-    convert_seconds = time.monotonic() - started
+    # Clean the PDF first: invisible publisher tags out, display equations
+    # turned into pictures, and a look at whether any page is two column.
+    source = src
+    columns = 1
+    if CONVERT_PREPARE and budget.have(5.0):
+        with stage("prepare"):
+            try:
+                import pdf_prepare
 
-    try:
-        _fill_empty_pages(raw, page_words, notes, pages)
-    except MemoryError:
-        raise
-    except Exception:
-        pass
+                cleaned = os.path.join(job_dir, "clean.pdf")
+                prep = pdf_prepare.prepare(src, cleaned, budget=budget)
+                columns = int(prep.get("columns") or 1)
+                if prep.get("ok"):
+                    source = cleaned
+                    if prep.get("equations_imaged"):
+                        notes.append("equations_imaged")
+                    if prep.get("invisible_removed") or prep.get("tokens_removed"):
+                        notes.append("hidden_text_removed")
+                else:
+                    notes.append("prepare_skipped")
+            except MemoryError:
+                raise
+            except Exception:
+                notes.append("prepare_skipped")
+    if columns > 1:
+        notes.append("two_column")
+
+    settings = dict(TUNED_SETTINGS)
+    if columns > 1:
+        # Let pdf2docx keep its own column logic, or a two column page is read
+        # straight across and the two columns interleave.
+        settings["min_section_height"] = 20.0
+    if not CONVERT_STREAM_TABLES:
+        settings["parse_stream_table"] = False
+        settings["extract_stream_table"] = False
+
+    with stage("pdf2docx"):
+        started = time.monotonic()
+        engine = _convert_once(source, raw, settings, pages, notes)
+        convert_seconds = time.monotonic() - started
+
+    with stage("fill"):
+        try:
+            _fill_empty_pages(raw, page_words, notes, pages, page_texts)
+        except MemoryError:
+            raise
+        except Exception:
+            pass
 
     # Stage D, the cheap half. It runs on every conversion and needs no render.
     recall = 1.0
-    try:
-        recall = _text_recall(page_words, raw)
-    except Exception:
-        recall = 1.0
+    with stage("recall"):
+        try:
+            recall = _text_recall(page_words, raw)
+        except Exception:
+            recall = 1.0
     if engine == "tuned" and recall < CONVERT_TEXT_RECALL_MIN:
         # A second conversion costs about what the first one did. On a long
         # file there is no room for it, and a file with most of its text is
@@ -832,19 +961,23 @@ def convert_with_repair(job_dir: str, mode: str, params: dict) -> dict:
         else:
             notes.append("retried_safer")
             retry = os.path.join(job_dir, "retry.docx")
-            try:
-                _convert_once(src, retry, SAFER_SETTINGS, pages, [])
-                if _text_recall(page_words, retry) > recall:
-                    shutil.copyfile(retry, raw)
-                    engine = "safer"
-            except MemoryError:
-                raise
-            except Exception:
-                pass
+            with stage("retry"):
+                try:
+                    safer = dict(SAFER_SETTINGS)
+                    safer["min_section_height"] = settings["min_section_height"]
+                    _convert_once(source, retry, safer, pages, [])
+                    if _text_recall(page_words, retry) > recall:
+                        shutil.copyfile(retry, raw)
+                        engine = "safer"
+                except MemoryError:
+                    raise
+                except Exception:
+                    pass
 
     repair_mode = "flow" if mode == "editable" else "layout"
     try:
-        report = docx_repair.repair(raw, out, repair_mode)
+        with stage("repair"):
+            report = docx_repair.repair(raw, out, repair_mode)
     except MemoryError:
         raise
     except Exception:
@@ -866,29 +999,43 @@ def convert_with_repair(job_dir: str, mode: str, params: dict) -> dict:
     _require_output(out)
     _mark_ready(job_dir, engine, notes)
 
-    if CONVERT_RENDER_CHECK and mode == "layout":
-        if CONVERT_RENDER_MAX_PAGES and selected > CONVERT_RENDER_MAX_PAGES:
-            notes.append("fit_skipped_pages")
-        else:
-            # A LibreOffice render costs roughly what the conversion did, with
-            # a floor for a very quick one.
-            render_estimate = max(15.0, convert_seconds * 0.8)
-            try:
-                best = _fit_pages(job_dir, out, len(page_words), notes, budget, render_estimate)
-                if best != out:
-                    # Replace in one step, so a kill cannot leave a half
-                    # written output.docx behind the ready marker.
-                    staged = out + ".fit"
-                    shutil.copyfile(best, staged)
+    if mode == "layout":
+        too_long = bool(CONVERT_RENDER_MAX_PAGES and selected > CONVERT_RENDER_MAX_PAGES)
+        with stage("fit"):
+            if CONVERT_RENDER_CHECK and not too_long:
+                # A LibreOffice render costs roughly what the conversion did,
+                # with a floor for a very quick one.
+                render_estimate = max(15.0, convert_seconds * 0.8)
+                try:
+                    best = _fit_pages(job_dir, out, len(page_words), notes, budget, render_estimate)
+                    if best != out:
+                        # Replace in one step, so a kill cannot leave a half
+                        # written output.docx behind the ready marker.
+                        staged = out + ".fit"
+                        shutil.copyfile(best, staged)
+                        os.replace(staged, out)
+                except MemoryError:
+                    raise
+                except Exception:
+                    pass
+            else:
+                # No render to measure against, so apply the one step that the
+                # 4 page article showed was enough and that costs nothing: a
+                # 3 percent tighter line and less space before each paragraph.
+                # Image paragraphs are left alone, as always.
+                notes.append("fit_skipped_pages" if too_long else "fit_not_rendered")
+                notes.append("spacing_tightened_blind")
+                try:
+                    staged = out + ".tight"
+                    _tighten(out, staged, 0.97, 0.85)
                     os.replace(staged, out)
-            except MemoryError:
-                raise
-            except Exception:
-                pass
+                except Exception:
+                    pass
         _mark_ready(job_dir, engine, notes)
 
     _require_output(out)
-    return {"engine": engine, "notes": ",".join(sorted(set(notes)))}
+    timings["text_engine"] = text_engine
+    return {"engine": engine, "notes": ",".join(sorted(set(notes))), "timings": timings}
 
 
 def task_pdf_to_word(job_dir: str, params: dict) -> dict:
@@ -1491,6 +1638,7 @@ class Job:
         self.deadline = 0.0
         self.responded = False
         self.error_type: str | None = None
+        self.stages: dict | None = None
         self.started = time.monotonic()
 
     def __enter__(self) -> "Job":
@@ -1629,6 +1777,10 @@ class Job:
             outcome = "generic"
             self.error_type = exc_type.__name__
         extra = f" error_type={self.error_type}" if self.error_type else ""
+        if self.stages:
+            # Seconds per stage, so a slow file can be read off the Render log
+            # without guessing. Numbers only, never a file name.
+            extra += " " + " ".join(f"{name}={value}" for name, value in self.stages.items())
         # No file names, paths or passwords in the log.
         log.info("job=%s tool=%s result=%s ms=%d%s", self.id, self.tool, outcome, elapsed_ms, extra)
 
@@ -1860,6 +2012,7 @@ def convert_pdf(
                     "budget": job.budget() if chosen else 0,
                 },
             )
+            job.stages = result.get("timings") if chosen else None
         except ApiError as err:
             # Nothing finished, and the time ran out. Point at the page range
             # rather than only "try a smaller file". The old page keeps the
