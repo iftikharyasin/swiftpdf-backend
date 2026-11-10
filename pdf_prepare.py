@@ -31,6 +31,12 @@ from __future__ import annotations
 import os
 import re
 
+# The publisher tags. One definition, shared with docx_repair, which is the
+# safety net for a file that skipped this step. They were two copies until
+# 10 November and they drifted apart, which is how 13 tags reached the Word
+# file as text. Both modules ship together, so the import is safe.
+from docx_repair import EQ_TOKEN
+
 __all__ = ["prepare", "is_math_font", "is_eq_token", "looks_like_math",
            "group_rows", "equation_regions", "column_count", "drop_overlapping"]
 
@@ -41,6 +47,8 @@ __all__ = ["prepare", "is_math_font", "is_eq_token", "looks_like_math",
 # ---------------------------------------------------------------------------
 
 MATH_SCORE_MIN = 0.50       # above this a row is treated as an equation
+PLAIN_WORDS_VETO = 5        # this many ordinary words and it is a sentence
+REGION_EDGE_GAP = 2.0       # points kept clear of the line above and below
 # Three kinds of evidence, weighted. The font says what the glyphs came from,
 # the characters say what they are, and the token lengths say how the line is
 # built: an equation is mostly one and two character pieces, prose is not.
@@ -68,13 +76,6 @@ MATH_FONT_HINTS = (
 )
 # A subset prefix such as "BVCJSW+" tells us nothing, so it comes off first.
 SUBSET_PREFIX = re.compile(r"^[A-Z]{6}\+")
-
-# The publisher tags. Kept in step with docx_repair.EQ_TOKEN, which is the
-# safety net for a file that skipped this step.
-EQ_TOKEN = re.compile(
-    r"\b(?:display|inline)[-_]?eq[-_]?(?:Equ?|Eq)?\d*\b|\bEqu\d+\b(?=\s*$)",
-    re.IGNORECASE,
-)
 
 DISPLAY_EQ_TOKEN = re.compile(r"\bdisplay[-_]?eq", re.IGNORECASE)
 
@@ -120,6 +121,20 @@ def _math_char_share(text: str) -> float:
     return hits / len(body)
 
 
+def _plain_words(text: str) -> int:
+    """How many ordinary words of four letters or more a line holds.
+
+    A word is ordinary when it is letters once the maths characters are taken
+    out, so "elasticities" counts and "β1" does not.
+    """
+    count = 0
+    for token in str(text or "").split():
+        letters = re.sub(r"[^A-Za-z]", "", token)
+        if len(letters) >= 4 and _math_char_share(token) < 0.34:
+            count += 1
+    return count
+
+
 def _repeat_share(text: str) -> float:
     """Share of characters that simply repeat the one before them.
 
@@ -149,6 +164,12 @@ def looks_like_math(text: str, math_font_share: float) -> tuple[bool, float]:
     if len(stripped) < 2:
         return False, 0.0
     tokens = stripped.split()
+    # A line carrying this many ordinary words is a sentence, whatever its
+    # fonts and symbols say. On 10 November the line "β1, β2, β3 are
+    # elasticities and εit captures stochastic error..." was swept into an
+    # equation picture; that cannot happen now.
+    if _plain_words(stripped) >= PLAIN_WORDS_VETO:
+        return False, 0.0
     short_share = (sum(1 for token in tokens if len(token) <= 3) / len(tokens)) if tokens else 0.0
     score = (W_FONT * float(math_font_share)
              + W_CHARS * _math_char_share(text)
@@ -161,6 +182,52 @@ def looks_like_math(text: str, math_font_share: float) -> tuple[bool, float]:
     if len(stripped) > 60 and len(words) >= 6:
         score *= 0.5
     return score >= MATH_SCORE_MIN, score
+
+
+def clean_math_text(text: str) -> str:
+    """Tidy maths glyphs read straight out of a PDF.
+
+    Two things go wrong. A maths font is often mapped to the Mathematical
+    Alphanumeric block, so a beta arrives as U+1D6FD rather than U+03B2, and a
+    broken ToUnicode map repeats every glyph, which is where "𝛽𝛽" came from.
+    Compatibility normalisation fixes the first and halving a doubled run
+    fixes the second.
+    """
+    import unicodedata
+
+    text = unicodedata.normalize("NFKC", str(text or ""))
+    out = []
+    index = 0
+    while index < len(text):
+        char = text[index]
+        run = 1
+        while index + run < len(text) and text[index + run] == char:
+            run += 1
+        # A doubled glyph is the ToUnicode fault. Three or more in a row is
+        # more likely to be real, such as an ellipsis of dots, so it is left.
+        out.append(char * (run // 2 if run == 2 and not char.isspace() else run))
+        index += run
+    return re.sub(r"\s+", " ", "".join(out)).strip()
+
+
+def inline_math_for(tag_box, visible_spans, pad: float = 1.0) -> str:
+    """The visible maths sitting under an inline tag, cleaned.
+
+    The tag is drawn on top of the glyphs it stands for, which is why its box
+    cannot simply be covered: covering it would take the beta with it. Reading
+    what is underneath lets the tag be replaced in the Word file instead.
+    """
+    hits = []
+    for span in visible_spans:
+        box = span.get("bbox")
+        text = str(span.get("text") or "")
+        if not box or not text.strip() or is_eq_token(text):
+            continue
+        if (box[0] - pad < tag_box[2] and box[2] + pad > tag_box[0]
+                and box[1] - pad < tag_box[3] and box[3] + pad > tag_box[1]):
+            hits.append((box[0], text))
+    hits.sort()
+    return clean_math_text("".join(text for _, text in hits))
 
 
 def group_rows(spans, tolerance: float = ROW_TOLERANCE):
@@ -242,12 +309,23 @@ def equation_regions(rows, page_box, body_box=None):
                 probe += 1
                 continue
             break
-        height = box[3] - box[1]
+        # Keep clear of the lines above and below. The picture spans the body
+        # width, so without this the 2 pt of air can reach far enough into a
+        # neighbouring line to put it in the image and then redact it away.
+        top = box[1] - REGION_EDGE_GAP
+        bottom = box[3] + REGION_EDGE_GAP
+        if index > 0:
+            above = _row_box(rows[index - 1])[3]
+            top = max(top, (above + box[1]) / 2.0 if above < box[1] else top)
+        if last + 1 < len(rows):
+            below = _row_box(rows[last + 1])[1]
+            bottom = min(bottom, (box[3] + below) / 2.0 if below > box[3] else bottom)
+
+        height = bottom - top
         if MIN_REGION_HEIGHT <= height <= page_height * MAX_REGION_SHARE:
-            # Widen to the body column so the picture is not cropped tight,
-            # and give it a little air.
-            regions.append((min(left, box[0]) - 2.0, box[1] - 2.0,
-                            max(right, box[2]) + 2.0, box[3] + 2.0))
+            # Widen to the body column so the picture is not cropped tight.
+            regions.append((min(left, box[0]) - 2.0, top,
+                            max(right, box[2]) + 2.0, bottom))
         index = last + 1
     return regions
 
@@ -350,6 +428,7 @@ def _new_report() -> dict:
         "equations_imaged": 0,
         "two_column_pages": 0,
         "columns": 1,
+        "inline_math": [],
     }
 
 
@@ -444,6 +523,20 @@ def prepare(src: str, dst: str, budget=None, max_equations_per_page: int = 12) -
             safe = drop_overlapping(targets + tokens, keep)
             report["invisible_removed"] += len(drop_overlapping(targets, keep))
             report["tokens_removed"] += len(drop_overlapping(tokens, keep))
+
+            # A tag that sits on top of the glyphs it stands for cannot be
+            # covered without taking them too, so it stays in the PDF and
+            # reaches the Word file as text. Read what is underneath it now,
+            # in reading order, so docx_repair can put that back in its place.
+            covered = {tuple(rect) for rect in safe}
+            stuck = [span for span in (hidden + visible)
+                     if is_eq_token(span.get("text")) and tuple(span["bbox"]) not in covered]
+            stuck.sort(key=lambda span: (round(span["bbox"][1], 1), span["bbox"][0]))
+            for span in stuck:
+                report["inline_math"].append({
+                    "tag": str(span.get("text") or "").strip(),
+                    "text": inline_math_for(span["bbox"], visible),
+                })
 
             # 2. Find the display equations and render them before anything is
             #    taken away, because the picture has to show what was there.

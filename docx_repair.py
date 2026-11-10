@@ -315,29 +315,190 @@ def fix_image_paragraphs(doc, report, space_before_pt=6.0) -> None:
 # tooling can find them. pdf_prepare.py takes them out of the PDF before
 # pdf2docx runs; this is the safety net for a file that skipped that step, or
 # for another publisher's spelling of the same idea.
+# Widened 10 November: Springer also writes the inline form as
+# "inline-eq-IEq5", which the old pattern missed, so 13 of them reached the
+# Word file as text. Kept in step with pdf_prepare.EQ_TOKEN.
+def _spaced(word: str) -> str:
+    """A word that pdf2docx may have broken with stray spaces.
+
+    Lifting text out of a PDF splits words wherever the glyph spacing looks
+    like a gap, so "inline-eq-IEq10" arrives as "inl ine- eq-IEq10". Allowing
+    optional space between every letter catches those without loosening the
+    match itself: the letters must still be in order, and still be followed by
+    the rest of the tag.
+    """
+    return r"\s*".join(re.escape(ch) for ch in word)
+
+
 EQ_TOKEN = re.compile(
-    r"\b(?:display|inline)[-_]?eq[-_]?(?:Equ?|Eq)?\d*\b|\bEqu\d+\b(?=\s*$)",
+    # inline-eq-IEq5, display_eq_Equ3, "inl ine- eq- IEq10"
+    r"(?i:\b(?:" + _spaced("inline") + r"|" + _spaced("display") + r")"
+    r"\s*[-_]\s*e\s*q\s*[-_]?\s*[A-Za-z]*\s*\d*)"
+    # Springer's bare inline marker: a capital I, then Eq, then the number.
+    # "IEq" is not a word, so this is safe anywhere in a sentence, which
+    # matters: 22 of them sat mid-sentence in the 10 November file.
+    r"|\bIEqu?\s?\d+\b"
+    # A bare "Eq12" or "Equ5" is only a tag when it ends the line. Mid
+    # sentence it is far more likely to be the author's own reference, and
+    # this document writes those as "Eq. 3".
+    r"|\b(?i:Equ?)\d+\b(?=\s*$)",
+)
+
+# The tag plus the punctuation that belongs to it. A list of three inline
+# symbols reaches Word as "uses TAG, TAG, TAG coefficient values". Deleting
+# only the three tags leaves "uses, ,  coefficient values", and tidying that
+# afterwards cannot tell which comma was the publisher's and which was ours.
+# So each tag is matched together with its own trailing separator and spacing:
+# dropping the tag drops them with it, and putting maths back in its place
+# keeps them.
+EQ_TOKEN_RUN = re.compile(
+    r"(?P<tag>" + EQ_TOKEN.pattern + r")(?P<sep>\s*[,;])?(?P<gap>[ \t]*)",
     re.IGNORECASE,
 )
 
+# What a deleted tag can still leave behind: a space before punctuation, an
+# empty bracket pair, a doubled space.
+ORPHAN_SEPARATORS = (
+    (re.compile(r"\s*,(\s*,)+"), ","),
+    (re.compile(r"\(\s*\)"), ""),
+    (re.compile(r"\s+([,.;:)])"), r"\1"),
+    (re.compile(r"\(\s+"), "("),
+    (re.compile(r"[ \t]{2,}"), " "),
+    (re.compile(r"(?:^|(?<=\s))[,;]\s+"), ""),
+)
 
-def drop_eq_tokens(doc, report) -> None:
-    """Remove publisher equation tags that came through as text."""
-    for paragraph in list(doc.paragraphs):
+
+def _sub_across_runs(paragraph, pattern, replacement) -> int:
+    """Substitute over a paragraph's whole text without flattening its runs.
+
+    A tag is often split between runs, "inline-eq-" in one and "IEq5" in the
+    next, so matching run by run leaves half of it behind. This matches on the
+    joined text, maps each match back to the runs it covers, and edits only
+    those, so bold and italic elsewhere in the paragraph survive.
+    """
+    runs = paragraph.runs
+    if not runs:
+        return 0
+    spans, offset = [], 0
+    for run in runs:
+        spans.append((run, offset, offset + len(run.text)))
+        offset += len(run.text)
+    whole = "".join(run.text for run in runs)
+
+    matches = list(pattern.finditer(whole))
+    if not matches:
+        return 0
+
+    # Work out every replacement first, reading left to right. The edits
+    # themselves have to run right to left so the offsets ahead of each one
+    # stay valid, but the caller hands out maths in document order, so asking
+    # for it in reverse gave the first tag the last equation.
+    texts = [
+        replacement(match) if callable(replacement) else match.expand(replacement)
+        for match in matches
+    ]
+
+    for match, text in zip(reversed(matches), reversed(texts)):
+        first = True
+        for run, start, end in spans:
+            if end <= match.start() or start >= match.end():
+                continue
+            cut_from = max(0, match.start() - start)
+            cut_to = min(len(run.text), match.end() - start)
+            run.text = run.text[:cut_from] + (text if first else "") + run.text[cut_to:]
+            first = False
+        # Offsets shift once a run is edited, so they are rebuilt each time.
+        spans, offset = [], 0
+        for run in runs:
+            spans.append((run, offset, offset + len(run.text)))
+            offset += len(run.text)
+    return len(matches)
+
+
+def _tidy_after_removal(paragraph) -> None:
+    for pattern, replacement in ORPHAN_SEPARATORS:
+        _sub_across_runs(paragraph, pattern, replacement)
+
+
+def iter_paragraphs(doc):
+    """Every paragraph in the body, including the ones inside tables.
+
+    pdf2docx puts a lot of a laid out page into tables, so a walk over
+    `doc.paragraphs` alone misses them. Reading the XML directly keeps nested
+    tables in scope as well.
+    """
+    from docx.text.paragraph import Paragraph
+
+    body = doc.element.body
+    for element in body.iter(qn("w:p")):
+        yield Paragraph(element, doc)
+
+
+def _only_paragraph_in_cell(element) -> bool:
+    """True when removing this paragraph would leave a table cell with none.
+
+    Word rejects an empty cell, so the last paragraph in one always stays.
+    """
+    parent = element.getparent()
+    if parent is None or parent.tag != qn("w:tc"):
+        return False
+    return len(parent.findall(qn("w:p"))) <= 1
+
+
+def drop_eq_tokens(doc, report, replacements=None) -> None:
+    """Replace publisher equation tags with the maths they stood for.
+
+    `replacements` is the ordered list `pdf_prepare` collected, one entry per
+    tag it could not safely cover in the PDF because the tag is drawn on top
+    of the glyphs it names. Covering it there would have taken the beta with
+    it, so the tag travels into the Word file and is swapped here instead.
+
+    With nothing to put back, the tag is deleted and the punctuation it
+    leaves behind is tidied, so "uses , ,  coefficient values" does not
+    happen.
+    """
+    queue = list(replacements or [])
+    position = 0
+
+    def next_replacement(tag):
+        nonlocal position
+        while position < len(queue):
+            entry = queue[position]
+            position += 1
+            if entry.get("tag") and entry["tag"].strip().lower() != tag.strip().lower():
+                # Out of step with the document: keep looking rather than
+                # putting the wrong maths in.
+                continue
+            return str(entry.get("text") or "")
+        return ""
+
+    for paragraph in list(iter_paragraphs(doc)):
         if not paragraph.runs:
             continue
         whole = "".join(run.text for run in paragraph.runs)
         if not EQ_TOKEN.search(whole):
             continue
-        for run in paragraph.runs:
-            if not run.text:
-                continue
-            cleaned = EQ_TOKEN.sub("", run.text)
-            if cleaned != run.text:
-                report["eq_tokens_removed"] += 1
-                run.text = re.sub(r"[ \t]{2,}", " ", cleaned)
+        def swap(match):
+            text = next_replacement(match.group("tag"))
+            if text:
+                report["eq_tokens_replaced"] += 1
+                # Keep the separator, so "β1, β2, β3" reads as it did.
+                return text + (match.group("sep") or "") + (match.group("gap") or "")
+            report["eq_tokens_removed"] += 1
+            # Nothing to put back, so the tag goes with the separator that
+            # belonged to it. "uses A, B, C coefficient" becomes "uses
+            # coefficient" rather than "uses, , coefficient".
+            return ""
+
+        _sub_across_runs(paragraph, EQ_TOKEN_RUN, swap)
+        # Then tidy what the removal left behind, across runs as well.
+        _tidy_after_removal(paragraph)
         # A paragraph that held nothing but tags is now empty furniture.
-        if not paragraph.text.strip() and not has_drawing(paragraph._element):
+        if (
+            not paragraph.text.strip()
+            and not has_drawing(paragraph._element)
+            and not _only_paragraph_in_cell(paragraph._element)
+        ):
             parent = paragraph._element.getparent()
             if parent is not None:
                 parent.remove(paragraph._element)
@@ -825,27 +986,99 @@ def merge_sections(doc, report) -> None:
             paragraph.remove(ppr)
 
 
-def drop_empty_paragraphs(doc, report, keep=1) -> None:
-    """Collapse a run of blank paragraphs left where page furniture was."""
+def drop_empty_paragraphs(doc, report, keep=0) -> None:
+    """Remove blank paragraphs that pdf2docx left behind.
+
+    These are not spacing the author asked for. In the 10 November file there
+    were 71 of them, each carrying an exact line height of 11 pt and 22 pt of
+    space after it: about 33 pt of nothing apiece, which is close to three
+    pages across the document. Keeping one of each run, as this used to, kept
+    all 71.
+
+    A paragraph holding a picture is never blank, and the one that carries a
+    section break is always left alone.
+    """
     from docx.text.paragraph import Paragraph
-
-    blanks = []
-
-    def flush():
-        for element in blanks[keep:]:
-            element.getparent().remove(element)
-            report["blank_paragraphs_removed"] += 1
-        blanks.clear()
 
     for element in list(doc.element.body.iterchildren(qn("w:p"))):
         paragraph = Paragraph(element, doc)
         ppr = element.find(qn("w:pPr"))
         ends_section = ppr is not None and ppr.find(qn("w:sectPr")) is not None
-        if not paragraph.text.strip() and not has_drawing(element) and not ends_section:
-            blanks.append(element)
-        else:
-            flush()
-    flush()
+        if paragraph.text.strip() or has_drawing(element) or ends_section:
+            continue
+        parent = element.getparent()
+        if parent is not None:
+            parent.remove(element)
+            report["blank_paragraphs_removed"] += 1
+
+
+def _max_font_pt(paragraph, fallback=0.0) -> float:
+    sizes = [run.font.size.pt for run in paragraph.runs if run.font.size is not None]
+    return max(sizes) if sizes else fallback
+
+
+def normalise_spacing(doc, report, max_gap_pt=8.0) -> None:
+    """Even out line spacing and cap the gaps between paragraphs.
+
+    pdf2docx measures a line height per paragraph from the PDF, so a document
+    comes back with dozens of slightly different multipliers, and after an
+    equation the measurements drift far enough that the text looks almost
+    double spaced. In flowing text none of that carries meaning, so every
+    paragraph gets single spacing and the space before and after is capped.
+
+    A paragraph holding a picture is left exactly as it is: proportional
+    spacing below 100 percent crops a tall inline image.
+
+    Keep layout wants this too, with a looser cap on the gaps. The 35 page
+    paper came back as 44 pages. About three of those were blank paragraphs,
+    and the rest was this: `max_line_spacing_ratio` lets pdf2docx write up to
+    125 percent, measured from the line pitch rather than asked for by the
+    author, and 15 percent of extra height over 35 pages is five more pages.
+    Single spacing is what the paper itself uses, so this moves the result
+    towards the original rather than away from it.
+    """
+    from docx.text.paragraph import Paragraph
+
+    for element in doc.element.body.iter(qn("w:p")):
+        if has_drawing(element):
+            continue
+        paragraph = Paragraph(element, doc)
+        if not paragraph.text.strip():
+            continue
+        ppr = element.find(qn("w:pPr"))
+        if ppr is None:
+            continue
+        spacing = ppr.find(qn("w:spacing"))
+        if spacing is None:
+            continue
+        changed = False
+        rule = spacing.get(qn("w:lineRule"))
+        line = spacing.get(qn("w:line"))
+        # Exact spacing smaller than the text would clip it, so that goes too.
+        too_tight = (rule == "exact" and line
+                     and int(line) < _max_font_pt(paragraph, 9.0) * 20 * 1.15)
+        if rule != "auto" or (line and line != "240") or too_tight:
+            spacing.set(qn("w:lineRule"), "auto")
+            spacing.set(qn("w:line"), "240")
+            changed = True
+        for side in ("w:before", "w:after"):
+            value = spacing.get(qn(side))
+            if value and int(value) > max_gap_pt * 20:
+                spacing.set(qn(side), str(int(max_gap_pt * 20)))
+                changed = True
+        if changed:
+            report["spacing_normalised"] += 1
+
+
+def drop_page_breaks(doc, report) -> None:
+    """Take out page breaks, which mean nothing once the text flows."""
+    for element in doc.element.body.iter(qn("w:p")):
+        for br in element.findall(".//" + qn("w:br")):
+            if br.get(qn("w:type")) == "page":
+                parent = br.getparent()
+                if parent is not None:
+                    parent.remove(br)
+                    report["page_breaks_removed"] += 1
 
 
 def set_page_setup(doc, extra=None, floor=18.0) -> None:
@@ -884,6 +1117,9 @@ def new_report() -> dict:
         "footer_rejected": [],
         "lines_lifted": 0,
         "eq_tokens_removed": 0,
+        "eq_tokens_replaced": 0,
+        "spacing_normalised": 0,
+        "page_breaks_removed": 0,
         "hyphens_joined": [],
         "hyphens_kept": [],
         "breaks_removed": 0,
@@ -893,8 +1129,13 @@ def new_report() -> dict:
     }
 
 
-def repair(in_path: str, out_path: str, mode: str = "flow") -> dict:
-    """Repair a pdf2docx DOCX. Returns the report."""
+def repair(in_path: str, out_path: str, mode: str = "flow",
+           inline_math=None) -> dict:
+    """Repair a pdf2docx DOCX. Returns the report.
+
+    `inline_math` is the ordered list `pdf_prepare` collected for tags it
+    could not cover in the PDF without taking the maths glyphs with them.
+    """
     document = Document(in_path)
     report = new_report()
     report["mode"] = mode
@@ -909,16 +1150,28 @@ def repair(in_path: str, out_path: str, mode: str = "flow") -> dict:
 
     fix_columns(document, report)
     fix_image_paragraphs(document, report)
-    drop_eq_tokens(document, report)
+    drop_eq_tokens(document, report, inline_math)
     drop_marker_runs(document, report)
     extra = lift_running_text(document, report)
     rejoin_hyphens(document, report)
     breaks_to_spaces(document, report)
 
+    # Blank paragraphs are pdf2docx leftovers in both modes. They carry no
+    # words and no picture, so all they add is height, and in Keep layout
+    # that height is what pushes a page onto the next one.
+    drop_empty_paragraphs(document, report)
+
     if mode == "flow":
         merge_broken_paragraphs(document, report)
-        drop_empty_paragraphs(document, report)
+        drop_page_breaks(document, report)
+        normalise_spacing(document, report)
         merge_sections(document, report)
+    else:
+        # Keep layout gets the same line spacing, with a looser cap on the
+        # gaps between paragraphs so the shape of the page survives. Without
+        # this the blind tighten has to find 26 percent, and 3 percent is all
+        # it can safely take.
+        normalise_spacing(document, report, max_gap_pt=12.0)
 
     set_page_setup(document, extra)
     document.save(out_path)

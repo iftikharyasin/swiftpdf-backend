@@ -900,6 +900,11 @@ def convert_with_repair(job_dir: str, mode: str, params: dict) -> dict:
     # turned into pictures, and a look at whether any page is two column.
     source = src
     columns = 1
+    # Inline maths the prepare step could not cover in the PDF, because the
+    # tag is drawn on top of the glyphs it names and redacting its box would
+    # take the beta with it. Those tags travel into the Word file and
+    # docx_repair swaps this text in for them, in document order.
+    inline_math: list = []
     if CONVERT_PREPARE and budget.have(5.0):
         with stage("prepare"):
             try:
@@ -908,6 +913,7 @@ def convert_with_repair(job_dir: str, mode: str, params: dict) -> dict:
                 cleaned = os.path.join(job_dir, "clean.pdf")
                 prep = pdf_prepare.prepare(src, cleaned, budget=budget)
                 columns = int(prep.get("columns") or 1)
+                inline_math = list(prep.get("inline_math") or [])
                 if prep.get("ok"):
                     source = cleaned
                     if prep.get("equations_imaged"):
@@ -977,7 +983,8 @@ def convert_with_repair(job_dir: str, mode: str, params: dict) -> dict:
     repair_mode = "flow" if mode == "editable" else "layout"
     try:
         with stage("repair"):
-            report = docx_repair.repair(raw, out, repair_mode)
+            report = docx_repair.repair(raw, out, repair_mode,
+                                        inline_math=inline_math)
     except MemoryError:
         raise
     except Exception:
