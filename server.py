@@ -18,6 +18,19 @@ How it stays safe on a small server:
   simple rate limit.
 - Error replies never contain raw exception text. Logs never contain file names.
 
+PDF to Word, 9 November 2026
+    /api/convert takes an optional `mode` field.
+      no mode               exactly what the old page gets today: pdf2docx
+                            with the settings it has always used, the same
+                            download name, no extra headers.
+      mode=editable         flowing paragraphs
+      mode=layout           one page per page
+    The two new modes run the tuned pipeline in `convert_with_repair`. Any
+    pdf2docx argument the installed version does not take is dropped before
+    the call and, if a call still fails on its arguments, the whole conversion
+    is retried with today's settings. So the new page can be tested against
+    this backend with no risk to the live page.
+
 Start the API:   uvicorn server:app --host 0.0.0.0 --port 10000
 Child process:   python server.py --worker <task> <job_dir>   (started by the API)
 
@@ -63,6 +76,13 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+def _env_flag(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in ("1", "true", "yes", "on")
+
+
 MB = 1024 * 1024
 
 # Browser origins that may call the API. www stays allowed until the www to
@@ -98,6 +118,16 @@ MAX_PAGES_OCR = _env_int("OPTIMAX_MAX_PAGES_OCR", 50)
 MAX_PAGES_PDF_TO_WORD = _env_int("OPTIMAX_MAX_PAGES_PDF_TO_WORD", 150)
 MAX_PAGES_PDF_TO_EXCEL_OCR = _env_int("OPTIMAX_MAX_PAGES_PDF_TO_EXCEL_OCR", 50)
 
+# PDF to Word, new modes only. None of these touch the old page.
+#   RENDER_CHECK  render the DOCX back through LibreOffice and tighten the
+#                 spacing if the page count grew. Off on the free tier: two
+#                 renders can cost more memory than a 512 MB instance has.
+#   TEXT_RECALL   share of the PDF's words that must survive into the DOCX
+#                 before the conversion is retried with safer settings.
+CONVERT_RENDER_CHECK = _env_flag("OPTIMAX_CONVERT_RENDER_CHECK", False)
+CONVERT_RENDER_TIMEOUT = max(10, _env_int("OPTIMAX_CONVERT_RENDER_TIMEOUT", 60))
+CONVERT_TEXT_RECALL_MIN = _env_float("OPTIMAX_CONVERT_TEXT_RECALL_MIN", 0.90)
+
 # Size limit (MB) and timeout (seconds) per endpoint. The size limits must
 # match the numbers the pages show (TOOLS.md section 3). Timeouts follow the
 # targets in TOOLS.md section 3.1.
@@ -120,6 +150,9 @@ WORKER_FILE = os.path.abspath(__file__)
 
 OCR_LANGUAGE_PATTERN = re.compile(r"[a-z_]{3,10}(\+[a-z_]{3,10}){0,4}")
 
+CONVERT_MODES = ("editable", "layout")
+PAGE_RANGE_PATTERN = re.compile(r"^\s*\d{1,5}(\s*-\s*\d{1,5})?(\s*,\s*\d{1,5}(\s*-\s*\d{1,5})?)*\s*$")
+
 
 # ---------------------------------------------------------------------------
 # Error codes and the messages users see.
@@ -137,6 +170,8 @@ MESSAGES = {
     "convert_failed": "We could not convert this file. It may be damaged, or saved in a format we cannot read.",
     "empty_file": "This file is empty. Please choose another file.",
     "no_tables": "No tabular data detected in this PDF. If this is a scanned document, please enable the OCR option.",
+    "no_text": "We found no text on these pages. Run OCR PDF first, then convert the result.",
+    "bad_pages": "We could not read that page range. Use numbers like 1-3, 5.",
     "busy": "Our server is working on another file. Please try again in a few seconds.",
     "timeout": "This file took too long to process. Try a smaller file or fewer pages.",
     "server_memory": "This file needed more memory than our server has. Try a smaller file or fewer pages.",
@@ -192,6 +227,31 @@ def safe_extension(filename: str | None, default: str) -> str:
     return ext if re.fullmatch(r"\.[a-z0-9]{1,5}", ext) else default
 
 
+def parse_page_range(text: str, page_count: int) -> list[int] | None:
+    """Turn "1-3, 5" into [0, 1, 2, 4]. None means every page."""
+    text = (text or "").strip()
+    if not text:
+        return None
+    if not PAGE_RANGE_PATTERN.match(text):
+        raise ApiError(400, "bad_pages")
+    wanted: list[int] = []
+    for part in text.split(","):
+        part = part.strip()
+        if "-" in part:
+            start_text, _, end_text = part.partition("-")
+            start, end = int(start_text), int(end_text)
+        else:
+            start = end = int(part)
+        if start < 1 or end < start or start > page_count:
+            raise ApiError(400, "bad_pages")
+        end = min(end, page_count)
+        wanted.extend(range(start - 1, end))
+    unique = sorted(set(wanted))
+    if not unique:
+        raise ApiError(400, "bad_pages")
+    return unique
+
+
 # ---------------------------------------------------------------------------
 # Worker tasks. These run only inside the child process, so the heavy
 # libraries are imported here and never load into the API process.
@@ -229,10 +289,463 @@ def _require_output(path: str) -> None:
         raise ApiError(500, "generic")
 
 
+# ---------------------------------------------------------------------------
+# PDF to Word
+# ---------------------------------------------------------------------------
+
+# Stage A. Everything the tuned pipeline asks pdf2docx for. Keys the installed
+# version does not know are dropped before the call, so this list is safe to
+# grow. pdf2docx 0.5.6 knows all of them.
+TUNED_SETTINGS = {
+    # Fault 4 at the source, where the line ends are still known.
+    "delete_end_line_hyphen": True,
+    # Never split a page into column sections. A value above any page height
+    # means the whole page is one section, which is where the bad <w:cols>
+    # came from.
+    "min_section_height": 10000.0,
+    "page_margin_factor_top": 0.0,
+    "page_margin_factor_bottom": 0.0,
+    # A bad page must not lose the rest of the file. The per page check below
+    # fills anything that comes back empty.
+    "ignore_page_error": True,
+    # One job at a time on the free tier.
+    "multi_processing": False,
+    "max_line_spacing_ratio": 1.25,
+}
+
+# What a retry uses when the tuned pass loses text. Table parsing is the most
+# common reason a page comes out scrambled, so it goes first.
+SAFER_SETTINGS = {
+    **TUNED_SETTINGS,
+    "parse_stream_table": False,
+    "parse_lattice_table": False,
+    "extract_stream_table": False,
+}
+
+# What the page has always sent. Used when no mode is given, and as the last
+# resort if a tuned call is refused by this version of pdf2docx.
+LEGACY_SETTINGS = {
+    "start": 0,
+    "end": None,
+    "multi_processing": False,
+    "page_layout_analysis": True,
+}
+
+
+def _known_settings() -> set:
+    """Setting names the installed pdf2docx actually has.
+
+    `default_settings` is a @property on the class, so reading it off the
+    class itself gives back the property object, not the dict. Call its
+    getter. The other shapes are covered in case a later version changes it.
+    """
+    try:
+        from pdf2docx.converter import Converter
+    except Exception:
+        return set()
+
+    known = None
+    prop = getattr(Converter, "default_settings", None)
+    if isinstance(prop, property):
+        try:
+            known = prop.fget(None)
+        except Exception:
+            known = None
+    elif isinstance(prop, dict):
+        known = prop
+
+    if not isinstance(known, dict):
+        try:
+            known = Converter().default_settings
+        except Exception:
+            known = None
+
+    return set(known) if isinstance(known, dict) else set()
+
+
+def _supported(settings: dict) -> dict:
+    """Drop any setting this build of pdf2docx does not have.
+
+    If the list cannot be read at all, send everything. `convert` merges the
+    keyword arguments into its own settings dict and ignores names it does not
+    use, so an unknown key costs nothing, while dropping every key would turn
+    Stage A off without saying so. `_convert_once` still falls back to the old
+    settings if a call is refused.
+    """
+    known = _known_settings()
+    if not known:
+        return dict(settings)
+    return {key: value for key, value in settings.items() if key in known}
+
+
+def _run_pdf2docx(src: str, out: str, settings: dict, pages: list[int] | None) -> None:
+    from pdf2docx import Converter
+
+    if os.path.exists(out):
+        os.remove(out)
+    converter = Converter(src)
+    try:
+        if pages is None:
+            converter.convert(out, **settings)
+        else:
+            converter.convert(out, pages=pages, **settings)
+    finally:
+        try:
+            converter.close()
+        except Exception:
+            pass
+
+
+def _convert_once(src: str, out: str, settings: dict, pages: list[int] | None, notes: list) -> str:
+    """Convert with `settings`, falling back to today's settings on refusal.
+
+    Returns the name of the settings that produced the file.
+    """
+    wanted = dict(_supported(settings))
+    if pages is not None:
+        wanted.pop("start", None)
+        wanted.pop("end", None)
+    try:
+        _run_pdf2docx(src, out, wanted, pages)
+        _require_output(out)
+        return "tuned"
+    except (TypeError, ValueError, KeyError, AttributeError):
+        # This build of pdf2docx does not take one of the arguments.
+        notes.append("legacy_settings")
+    except ApiError:
+        notes.append("legacy_settings")
+    except MemoryError:
+        raise
+    except Exception:
+        notes.append("legacy_settings")
+
+    legacy = dict(LEGACY_SETTINGS)
+    if pages is not None:
+        legacy.pop("start", None)
+        legacy.pop("end", None)
+    _run_pdf2docx(src, out, legacy, pages)
+    _require_output(out)
+    return "legacy"
+
+
+def _pdf_page_words(src: str, pages: list[int] | None) -> list[list[str]]:
+    """Words per page, used by the page check and the text check."""
+    import pdfplumber
+
+    out: list[list[str]] = []
+    with pdfplumber.open(src) as pdf:
+        wanted = range(len(pdf.pages)) if pages is None else pages
+        for index in wanted:
+            if index >= len(pdf.pages):
+                continue
+            try:
+                text = pdf.pages[index].extract_text() or ""
+            except Exception:
+                text = ""
+            out.append(re.findall(r"[^\W\d_]{2,}", text, flags=re.UNICODE))
+    return out
+
+
+def _docx_sections_text(path: str) -> list[str]:
+    """Text per section. pdf2docx writes one section per converted page."""
+    from docx import Document
+    from docx.oxml.ns import qn
+    from docx.text.paragraph import Paragraph
+
+    document = Document(path)
+    chunks, current = [], []
+    for child in document.element.body.iterchildren():
+        tag = child.tag.split("}")[1]
+        if tag == "p":
+            current.append(Paragraph(child, document).text)
+            ppr = child.find(qn("w:pPr"))
+            if ppr is not None and ppr.find(qn("w:sectPr")) is not None:
+                chunks.append("\n".join(current))
+                current = []
+        elif tag == "sectPr":
+            chunks.append("\n".join(current))
+            current = []
+    if current:
+        chunks.append("\n".join(current))
+    return chunks
+
+
+def _fill_empty_pages(path: str, page_words: list[list[str]], notes: list,
+                      pages: list[int] | None = None) -> None:
+    """Stage C. No page may come back empty when the PDF page has text.
+
+    Images and layout cannot be recovered here, but the text is not lost. The
+    page gets the words pdfplumber reads, in reading order, as plain
+    paragraphs.
+    """
+    from docx import Document
+    from docx.oxml.ns import qn
+    from docx.text.paragraph import Paragraph
+    import pdfplumber
+
+    sections = _docx_sections_text(path)
+    missing = [
+        index
+        for index, words in enumerate(page_words)
+        if len(words) >= 20 and index < len(sections) and len(sections[index].split()) < max(5, len(words) * 0.1)
+    ]
+    if not missing:
+        return
+
+    document = Document(path)
+    # Find the paragraph that closes each section, so text lands on its page.
+    closers = []
+    for child in document.element.body.iterchildren(qn("w:p")):
+        ppr = child.find(qn("w:pPr"))
+        if ppr is not None and ppr.find(qn("w:sectPr")) is not None:
+            closers.append(child)
+
+    source = os.path.join(os.path.dirname(path), "input.pdf")
+    recovered = 0
+    with pdfplumber.open(source) as pdf:
+        for index in missing:
+            # `index` is the position in the selection. With a page range the
+            # real page is pages[index]; without one the two are the same.
+            real = pages[index] if pages else index
+            if index >= len(closers) or real >= len(pdf.pages):
+                continue
+            try:
+                text = pdf.pages[real].extract_text() or ""
+            except Exception:
+                text = ""
+            if not text.strip():
+                continue
+            anchor = Paragraph(closers[index], document)
+            for line in reversed([line for line in text.splitlines() if line.strip()]):
+                new = anchor.insert_paragraph_before(line.strip())
+                new.style = anchor.style
+            recovered += 1
+    if recovered:
+        document.save(path)
+        notes.append("page_text_recovered")
+
+
+def _text_recall(src_words: list[list[str]], docx_path: str) -> float:
+    """Share of the PDF's words that survived into the DOCX."""
+    from docx import Document
+
+    wanted: list[str] = [word.lower() for page in src_words for word in page]
+    if len(wanted) < 30:
+        return 1.0
+    document = Document(docx_path)
+    have = set()
+
+    def collect(text):
+        for word in re.findall(r"[^\W\d_]{2,}", text, flags=re.UNICODE):
+            have.add(word.lower())
+
+    for paragraph in document.paragraphs:
+        collect(paragraph.text)
+    # A running head lifted into a real header still counts as kept text.
+    for section in document.sections:
+        for name in ("header", "footer", "even_page_header", "even_page_footer"):
+            part = getattr(section, name, None)
+            if part is None:
+                continue
+            for paragraph in part.paragraphs:
+                collect(paragraph.text)
+    for table in document.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                for word in re.findall(r"[^\W\d_]{2,}", cell.text, flags=re.UNICODE):
+                    have.add(word.lower())
+    hits = sum(1 for word in wanted if word in have)
+    return hits / len(wanted)
+
+
+def _render_pdf(docx_path: str, out_dir: str, timeout: int) -> str | None:
+    os.makedirs(out_dir, exist_ok=True)
+    profile = os.path.join(out_dir, "lo-profile")
+    try:
+        subprocess.run(
+            [
+                LIBREOFFICE_BIN,
+                f"-env:UserInstallation=file://{profile}",
+                "--headless",
+                "--norestore",
+                "--nolockcheck",
+                "--convert-to",
+                "pdf",
+                "--outdir",
+                out_dir,
+                docx_path,
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=timeout,
+            check=False,
+        )
+    except Exception:
+        return None
+    produced = [name for name in os.listdir(out_dir) if name.lower().endswith(".pdf")]
+    return os.path.join(out_dir, produced[0]) if produced else None
+
+
+def _page_count(pdf_path: str) -> int:
+    try:
+        import pikepdf
+
+        with pikepdf.open(pdf_path) as pdf:
+            return len(pdf.pages)
+    except Exception:
+        return 0
+
+
+def _tighten(src: str, dst: str, line_scale: float, before_scale: float) -> None:
+    """Shrink line spacing a little, never on a paragraph holding a picture.
+
+    Proportional line spacing below 100 percent crops a tall inline image, so
+    an image paragraph is left exactly as it is.
+    """
+    from docx import Document
+    from docx.oxml.ns import qn
+
+    document = Document(src)
+    # Walk the paragraphs rather than every w:spacing, and skip the ones that
+    # hold a picture. Identity cannot be used to mark elements here: lxml
+    # builds a new proxy object each time a node is reached, so an id() taken
+    # in one pass does not match the same node in the next.
+    for paragraph in document.element.body.iter(qn("w:p")):
+        if paragraph.findall(".//" + qn("w:drawing")) or paragraph.findall(".//" + qn("w:pict")):
+            continue
+        ppr = paragraph.find(qn("w:pPr"))
+        spacing = ppr.find(qn("w:spacing")) if ppr is not None else None
+        if spacing is None:
+            continue
+        rule = spacing.get(qn("w:lineRule"))
+        line = spacing.get(qn("w:line"))
+        if line:
+            floor = 200 if rule in ("auto", None) else 120
+            try:
+                spacing.set(qn("w:line"), str(max(floor, int(int(line) * line_scale))))
+            except ValueError:
+                pass
+        before = spacing.get(qn("w:before"))
+        if before:
+            try:
+                spacing.set(qn("w:before"), str(int(int(before) * before_scale)))
+            except ValueError:
+                pass
+    document.save(dst)
+
+
+def _fit_pages(job_dir: str, docx_path: str, target_pages: int, notes: list) -> str:
+    """Stage D, the expensive half. Off unless OPTIMAX_CONVERT_RENDER_CHECK."""
+    work = os.path.join(job_dir, "fit")
+    rendered = _render_pdf(docx_path, os.path.join(work, "r0"), CONVERT_RENDER_TIMEOUT)
+    pages = _page_count(rendered) if rendered else 0
+    if not pages or not target_pages or pages <= target_pages:
+        return docx_path
+
+    best, best_pages = docx_path, pages
+    for index, (line_scale, before_scale) in enumerate(((0.97, 0.85), (0.94, 0.70)), start=1):
+        candidate = os.path.join(work, f"try{index}.docx")
+        try:
+            _tighten(docx_path, candidate, line_scale, before_scale)
+        except Exception:
+            break
+        rendered = _render_pdf(candidate, os.path.join(work, f"r{index}"), CONVERT_RENDER_TIMEOUT)
+        got = _page_count(rendered) if rendered else 0
+        if got and got < best_pages:
+            best, best_pages = candidate, got
+            notes.append("spacing_tightened")
+        if best_pages <= target_pages:
+            break
+    return best
+
+
+def convert_with_repair(job_dir: str, mode: str, params: dict) -> dict:
+    """Stages A to E for the two new modes."""
+    import docx_repair
+
+    src = os.path.join(job_dir, "input.pdf")
+    out = os.path.join(job_dir, "output.docx")
+    raw = os.path.join(job_dir, "raw.docx")
+    notes: list[str] = []
+
+    page_count = _check_pdf(src, 403)
+    pages = parse_page_range(params.get("pages") or "", page_count)
+    _check_page_cap(len(pages) if pages else page_count, int(params.get("max_pages") or 0))
+
+    page_words = _pdf_page_words(src, pages)
+    if not any(len(words) >= 5 for words in page_words):
+        raise ApiError(422, "no_text")
+
+    engine = _convert_once(src, raw, TUNED_SETTINGS, pages, notes)
+
+    try:
+        _fill_empty_pages(raw, page_words, notes, pages)
+    except MemoryError:
+        raise
+    except Exception:
+        pass
+
+    # Stage D, the cheap half. It runs on every conversion and needs no render.
+    recall = 1.0
+    try:
+        recall = _text_recall(page_words, raw)
+    except Exception:
+        recall = 1.0
+    if engine == "tuned" and recall < CONVERT_TEXT_RECALL_MIN:
+        notes.append("retried_safer")
+        retry = os.path.join(job_dir, "retry.docx")
+        try:
+            _convert_once(src, retry, SAFER_SETTINGS, pages, [])
+            if _text_recall(page_words, retry) > recall:
+                shutil.copyfile(retry, raw)
+                engine = "safer"
+        except MemoryError:
+            raise
+        except Exception:
+            pass
+
+    repair_mode = "flow" if mode == "editable" else "layout"
+    try:
+        report = docx_repair.repair(raw, out, repair_mode)
+    except MemoryError:
+        raise
+    except Exception:
+        # The repair step is an improvement, never a gate. Hand back the file
+        # pdf2docx made rather than failing the job.
+        shutil.copyfile(raw, out)
+        notes.append("repair_skipped")
+        report = {}
+
+    if report.get("columns_fixed"):
+        notes.append("columns_fixed")
+    if report.get("hyphens_joined"):
+        notes.append("hyphens_joined")
+    if report.get("markers_removed"):
+        notes.append("markers_removed")
+
+    if CONVERT_RENDER_CHECK and mode == "layout":
+        try:
+            best = _fit_pages(job_dir, out, len(page_words), notes)
+            if best != out:
+                shutil.copyfile(best, out)
+        except MemoryError:
+            raise
+        except Exception:
+            pass
+
+    _require_output(out)
+    return {"engine": engine, "notes": ",".join(sorted(set(notes)))}
+
+
 def task_pdf_to_word(job_dir: str, params: dict) -> dict:
     src = os.path.join(job_dir, "input.pdf")
     out = os.path.join(job_dir, "output.docx")
+    mode = (params.get("mode") or "").strip().lower()
 
+    if mode in CONVERT_MODES:
+        return convert_with_repair(job_dir, mode, params)
+
+    # No mode: exactly what the live page has always received.
     pages = _check_pdf(src, 403)
     _check_page_cap(pages, int(params.get("max_pages") or 0))
 
@@ -918,7 +1431,7 @@ class Job:
             raise ApiError(422, "convert_failed")
         os.replace(produced_path, os.path.join(self.dir, "output.pdf"))
 
-    def file_response(self, name: str, media_type: str, download_name: str) -> FileResponse:
+    def file_response(self, name: str, media_type: str, download_name: str, headers: dict | None = None) -> FileResponse:
         path = os.path.join(self.dir, name)
         if not os.path.exists(path) or os.path.getsize(path) == 0:
             raise ApiError(500, "generic")
@@ -927,6 +1440,7 @@ class Job:
             path,
             media_type=media_type,
             filename=download_name,
+            headers=headers or None,
             background=BackgroundTask(remove_dir, self.dir),
         )
 
@@ -1111,8 +1625,8 @@ class RequestGuardMiddleware:
 async def lifespan(_app):
     startup_cleanup()
     log.info(
-        "start max_jobs=%d max_waiting=%d timeout_factor=%.2f origins=%s",
-        MAX_JOBS, MAX_WAITING, TIMEOUT_FACTOR, ",".join(ALLOWED_ORIGINS),
+        "start max_jobs=%d max_waiting=%d timeout_factor=%.2f render_check=%s origins=%s",
+        MAX_JOBS, MAX_WAITING, TIMEOUT_FACTOR, CONVERT_RENDER_CHECK, ",".join(ALLOWED_ORIGINS),
     )
     yield
 
@@ -1127,7 +1641,7 @@ app.add_middleware(
     allow_credentials=False,
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
-    expose_headers=["Content-Disposition", "Retry-After"],
+    expose_headers=["Content-Disposition", "Retry-After", "X-Optimax-Engine", "X-Optimax-Notes"],
     max_age=600,
 )
 
@@ -1148,11 +1662,44 @@ XLSX_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
 
 @app.post("/api/convert")
-def convert_pdf(file: UploadFile = File(...)):
+def convert_pdf(
+    file: UploadFile = File(...),
+    mode: str = Form(""),
+    pages: str = Form(""),
+):
+    """PDF to Word.
+
+    No mode, or a mode we do not know, is the old page: same engine, same
+    settings, same download name, no extra headers. mode=editable and
+    mode=layout run the tuned pipeline.
+    """
+    chosen = (mode or "").strip().lower()
+    chosen = chosen if chosen in CONVERT_MODES else ""
+
     with Job("/api/convert", file) as job:
         job.start(".pdf")
-        job.run_worker("pdf_to_word", {"max_pages": MAX_PAGES_PDF_TO_WORD})
-        return job.file_response("output.docx", DOCX_TYPE, f"OptimaxPDF_Converted_{job.base}.docx")
+        result = job.run_worker(
+            "pdf_to_word",
+            {
+                "max_pages": MAX_PAGES_PDF_TO_WORD,
+                "mode": chosen,
+                "pages": pages if chosen else "",
+            },
+        )
+        if not chosen:
+            return job.file_response("output.docx", DOCX_TYPE, f"OptimaxPDF_Converted_{job.base}.docx")
+
+        suffix = "Editable" if chosen == "editable" else "Layout"
+        headers = {
+            "X-Optimax-Engine": str(result.get("engine") or "tuned")[:32],
+            "X-Optimax-Notes": str(result.get("notes") or "")[:200],
+        }
+        return job.file_response(
+            "output.docx",
+            DOCX_TYPE,
+            f"OptimaxPDF_Converted_{suffix}_{job.base}.docx",
+            headers=headers,
+        )
 
 
 @app.post("/api/word-to-pdf")
