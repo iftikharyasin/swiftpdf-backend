@@ -184,7 +184,17 @@ TOOL_LIMITS = {
     "/api/excel-to-pdf": (20, 120),
     "/api/ppt-to-pdf": (20, 120),
     "/api/pdf-to-excel": (20, 180),
+    # Merge PDF. The page merges in the browser by default and only sends a
+    # job here when the batch is too big for a browser to merge comfortably
+    # (TOOLS.md, merge-pdf). Combining pages is cheap CPU-wise, so the limit
+    # is about memory and upload time, not processing time.
+    "/api/merge": (80, 90),
 }
+
+# Merge PDF's own caps, read by the frontend through /health so the page and
+# the server cannot drift apart.
+MAX_FILES_MERGE = _env_int("OPTIMAX_MAX_FILES_MERGE", 30)
+MAX_PAGES_MERGE = _env_int("OPTIMAX_MAX_PAGES_MERGE", 2000)
 
 # Room for multipart headers and form fields around the file itself.
 MULTIPART_SLACK_BYTES = 1 * MB
@@ -223,6 +233,7 @@ MESSAGES = {
     "forbidden_origin": "Requests from this website are not allowed.",
     "bad_request": "Some required information is missing. Please try again.",
     "bad_language": "This OCR language is not available.",
+    "too_many_files": "Too many files for one merge. Please merge in smaller batches.",
     "generic": "We could not process your file. Please try again.",
 }
 
@@ -1427,6 +1438,60 @@ def task_excel_prepare(job_dir: str, params: dict) -> dict:
     return {"target": target_name}
 
 
+def task_merge(job_dir: str, params: dict) -> dict:
+    """Merge PDF, server side. Only used when a batch is too big to merge in
+    the browser (TOOLS.md, merge-pdf). `order` is a list of
+    {"file": i, "page": p, "rotate": r} objects, both i and p zero based, r
+    one of 0, 90, 180 or 270. The frontend builds this from the exact page
+    order it already shows, so the result matches the preview page for page.
+    """
+    from pypdf import PdfReader, PdfWriter
+
+    order = params.get("order") or []
+    if not order:
+        raise ApiError(400, "bad_request", "Nothing to merge.")
+
+    cap = int(params.get("max_pages") or 0)
+    if cap and len(order) > cap:
+        raise ApiError(413, "too_many_pages", f"The merged file would have more than {cap} pages.")
+
+    readers: dict[int, "PdfReader"] = {}
+
+    def reader_for(index: int):
+        if index not in readers:
+            path = os.path.join(job_dir, f"input-{index}.pdf")
+            try:
+                reader = PdfReader(path)
+            except Exception:
+                raise ApiError(422, "corrupt")
+            if reader.is_encrypted:
+                raise ApiError(403, "encrypted")
+            readers[index] = reader
+        return readers[index]
+
+    writer = PdfWriter()
+    for item in order:
+        try:
+            file_index = int(item.get("file"))
+            page_index = int(item.get("page"))
+            rotate = int(item.get("rotate") or 0) % 360
+        except (TypeError, ValueError):
+            raise ApiError(400, "bad_request", "Could not read the page order.")
+        reader = reader_for(file_index)
+        if page_index < 0 or page_index >= len(reader.pages):
+            raise ApiError(400, "bad_request", "A requested page does not exist in its file.")
+        writer.add_page(reader.pages[page_index])
+        if rotate:
+            writer.pages[-1].rotate(rotate)
+
+    out = os.path.join(job_dir, "output.pdf")
+    with open(out, "wb") as handle:
+        writer.write(handle)
+
+    _require_output(out)
+    return {}
+
+
 WORKER_TASKS = {
     "pdf_to_word": task_pdf_to_word,
     "compress": task_compress,
@@ -1435,6 +1500,7 @@ WORKER_TASKS = {
     "ocr": task_ocr,
     "pdf_to_excel": task_pdf_to_excel,
     "excel_prepare": task_excel_prepare,
+    "merge": task_merge,
 }
 
 
@@ -1797,6 +1863,134 @@ class Job:
         return False
 
 
+class MergeJob:
+    """Like Job, but for /api/merge: several PDFs in, one PDF out.
+
+    Kept separate from Job rather than bent to fit it, so every other tool
+    that uses Job is untouched by this. The slot, timing and logging mirror
+    Job exactly, so a merge job reads the same in the Render log as any
+    other.
+    """
+
+    def __init__(self, uploads: list):
+        self.tool = "merge"
+        self.max_mb, base_timeout = TOOL_LIMITS["/api/merge"]
+        self.timeout = base_timeout * TIMEOUT_FACTOR
+        self.uploads = uploads
+        self.id = uuid.uuid4().hex[:12]
+        self.base = display_base(uploads[0].filename) if uploads else "document"
+        self.dir: str | None = None
+        self.slot: int | None = None
+        self.deadline = 0.0
+        self.responded = False
+        self.error_type: str | None = None
+        self.stages: dict | None = None
+        self.started = time.monotonic()
+
+    def __enter__(self) -> "MergeJob":
+        sweep_stale_jobs()
+        if not self.uploads:
+            raise ApiError(400, "empty_file")
+        if len(self.uploads) > MAX_FILES_MERGE:
+            raise ApiError(413, "too_many_files")
+        total = 0
+        for upload in self.uploads:
+            size = upload_size(upload)
+            if size == 0:
+                raise ApiError(400, "empty_file")
+            total += size
+        if total > self.max_mb * MB:
+            raise ApiError(413, "file_too_large", file_too_large_message(self.max_mb))
+        os.makedirs(JOBS_ROOT, exist_ok=True)
+        self.dir = tempfile.mkdtemp(prefix="job-", dir=JOBS_ROOT)
+        return self
+
+    def start(self) -> None:
+        """Save every upload under a fixed, numbered name, then wait for a
+        free slot."""
+        for index, upload in enumerate(self.uploads):
+            target = os.path.join(self.dir, f"input-{index}.pdf")
+            upload.file.seek(0)
+            with open(target, "wb") as handle:
+                shutil.copyfileobj(upload.file, handle, length=1 * MB)
+        self.slot = SLOTS.acquire(QUEUE_WAIT_SECONDS)
+        self.deadline = time.monotonic() + self.timeout
+
+    def _remaining(self) -> float:
+        remaining = self.deadline - time.monotonic()
+        if remaining <= 0:
+            raise ApiError(422, "timeout")
+        return remaining
+
+    def run_worker(self, task: str, params: dict) -> dict:
+        result_path = os.path.join(self.dir, "result.json")
+        if os.path.exists(result_path):
+            os.remove(result_path)
+
+        returncode = run_child(
+            [sys.executable, WORKER_FILE, "--worker", task, self.dir],
+            self._remaining(),
+            cwd=self.dir,
+            stdin_bytes=json.dumps(params).encode("utf-8"),
+        )
+
+        try:
+            with open(result_path, encoding="utf-8") as handle:
+                result = json.load(handle)
+        except (OSError, ValueError):
+            result = None
+
+        if result is None:
+            if returncode in (-signal.SIGKILL, 137):
+                raise ApiError(422, "server_memory")
+            self.error_type = f"exit:{returncode}"
+            raise ApiError(500, "generic")
+
+        if not result.get("ok"):
+            self.error_type = result.get("error_type")
+            raise ApiError(
+                int(result.get("status", 500)),
+                result.get("code", "generic"),
+                result.get("message"),
+            )
+        return result
+
+    def file_response(self, name: str, media_type: str, download_name: str) -> FileResponse:
+        path = os.path.join(self.dir, name)
+        if not os.path.exists(path) or os.path.getsize(path) == 0:
+            raise ApiError(500, "generic")
+        self.responded = True
+        return FileResponse(
+            path,
+            media_type=media_type,
+            filename=download_name,
+            background=BackgroundTask(remove_dir, self.dir),
+        )
+
+    def __exit__(self, exc_type, exc, tb):
+        if self.slot is not None:
+            SLOTS.release(self.slot)
+            self.slot = None
+
+        if exc_type is not None or not self.responded:
+            remove_dir(self.dir)
+
+        elapsed_ms = int((time.monotonic() - self.started) * 1000)
+        if exc_type is None:
+            outcome = "ok"
+        elif isinstance(exc, ApiError):
+            outcome = exc.code
+        else:
+            outcome = "generic"
+            self.error_type = exc_type.__name__
+        extra = f" error_type={self.error_type}" if self.error_type else ""
+        log.info("job=%s tool=%s result=%s ms=%d%s files=%d", self.id, self.tool, outcome, elapsed_ms, extra, len(self.uploads))
+
+        if exc_type is not None and not isinstance(exc, ApiError):
+            raise ApiError(500, "generic") from None
+        return False
+
+
 # ---------------------------------------------------------------------------
 # Request guard: allowed origins, early size check, rate limit
 # ---------------------------------------------------------------------------
@@ -2118,6 +2312,36 @@ def pdf_to_excel(file: UploadFile = File(...), ocr: bool = Form(False)):
         return job.file_response("output.xlsx", XLSX_TYPE, f"OptimaxPDF_Extracted_{job.base}.xlsx")
 
 
+@app.post("/api/merge")
+def merge_pdfs(files: list[UploadFile] = File(...), order: str = Form("")):
+    """Merge PDF, server side.
+
+    The page merges in the browser itself and only calls this when a batch
+    is too big for that to stay smooth (TOOLS.md, merge-pdf). `order` is a
+    JSON array of {"file": i, "page": p, "rotate": r} objects matching the
+    exact page order already shown on the page, both i and p zero based. With
+    no order, every page of every file is used, in the order the files were
+    sent.
+    """
+    try:
+        plan = json.loads(order) if order else None
+    except ValueError:
+        raise ApiError(400, "bad_request", "Could not read the page order.")
+    if plan is not None and not isinstance(plan, list):
+        raise ApiError(400, "bad_request", "Could not read the page order.")
+
+    with MergeJob(files) as job:
+        job.start()
+        if plan is None:
+            plan = []
+            for index in range(len(files)):
+                path = os.path.join(job.dir, f"input-{index}.pdf")
+                pages = _check_pdf(path, 403)
+                plan.extend({"file": index, "page": page, "rotate": 0} for page in range(pages))
+        job.run_worker("merge", {"order": plan, "max_pages": MAX_PAGES_MERGE})
+        return job.file_response("output.pdf", PDF_TYPE, f"OptimaxPDF_Merged_{job.base}.pdf")
+
+
 @app.get("/")
 async def health_check():
     # Unchanged reply. The home page pings this to wake the server.
@@ -2130,7 +2354,12 @@ async def health():
     # convert_soft_pages is the page count above which PDF to Word warns that
     # a file will take a few minutes. The page keeps its own default in
     # config.js and prefers this value when it has it, so the two cannot drift.
-    return {"status": "ok", "convert_soft_pages": CONVERT_SOFT_PAGES}
+    return {
+        "status": "ok",
+        "convert_soft_pages": CONVERT_SOFT_PAGES,
+        "merge_max_files": MAX_FILES_MERGE,
+        "merge_max_pages": MAX_PAGES_MERGE,
+    }
 
 
 if __name__ == "__main__":
