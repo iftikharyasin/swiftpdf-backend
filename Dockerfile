@@ -5,8 +5,8 @@
 #
 # 9 November 2026: the three metric compatible font families, which the PDF to
 # Word rebuild needs.
-# 20 November 2026: Noto and Noto Nastaliq Urdu, so documents in Arabic and
-# Urdu convert instead of coming back as empty boxes (AUDIT.md 3.9 and 6.12).
+# 20 November 2026: fonts-noto-core, so documents in Arabic and Urdu convert
+# instead of coming back as empty boxes (AUDIT.md 3.9 and 6.12).
 FROM python:3.10-slim
 
 ENV PYTHONUNBUFFERED=1 \
@@ -25,21 +25,21 @@ ENV PYTHONUNBUFFERED=1 \
 #                           metrics of Times New Roman, Arial and Courier New
 #   fonts-crosextra-carlito Carlito, which matches Calibri
 #   fonts-crosextra-caladea Caladea, which matches Cambria
-#   fonts-noto-core         Noto, which covers Arabic and most other scripts
-#   fonts-noto-nastaliq-urdu
-#                           Nastaliq, the style Urdu is actually written in.
-#                           Without it Urdu falls back to an Arabic style that
-#                           reads wrongly to anyone who reads Urdu, so the
-#                           Arabic coverage above is not enough on its own.
+#   fonts-noto-core         Noto, covering Arabic and most other scripts. It
+#                           carries Noto Naskh Arabic, Noto Kufi Arabic and
+#                           Noto Nastaliq Urdu, Nastaliq being the style Urdu
+#                           is actually written in, so this one package serves
+#                           both scripts. There is no separate Debian package
+#                           for Nastaliq; asking for one fails the build.
 #
 # PDF to Word maps PostScript font names onto the first four families, so with
 # these installed the server lays a page out the way Word will. Word to PDF
 # gets the same benefit: until 9 November it had no Microsoft compatible fonts
 # at all and reflowed every page (AUDIT.md 3.9).
 #
-# The two Noto packages enlarge the image and so lengthen a cold start. Watch
-# the first deploy after adding them. fonts-noto-core is already the trimmed
-# package; fonts-noto, the full set, is far larger and is not worth it here.
+# Noto enlarges the image and so lengthens a cold start. Watch the first
+# deploy after adding it. fonts-noto-core is already the trimmed package;
+# fonts-noto, the full set, is far larger and is not worth it here.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     tesseract-ocr \
     tesseract-ocr-eng \
@@ -57,7 +57,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     fonts-crosextra-carlito \
     fonts-crosextra-caladea \
     fonts-noto-core \
-    fonts-noto-nastaliq-urdu \
     libgl1 \
     libglib2.0-0 \
     tini \
