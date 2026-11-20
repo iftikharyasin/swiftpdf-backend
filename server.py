@@ -1789,8 +1789,14 @@ class Job:
             )
         return result
 
-    def libreoffice_to_pdf(self, src_name: str) -> None:
-        """Convert <job_dir>/<src_name> to <job_dir>/output.pdf."""
+    def libreoffice_to_pdf(self, src_name: str, convert_to: str = "pdf") -> None:
+        """Convert <job_dir>/<src_name> to <job_dir>/output.pdf.
+
+        `convert_to` is the value handed to LibreOffice's --convert-to. The
+        default is exactly what every tool sent before, so Excel to PDF and
+        PowerPoint to PDF are unchanged. Word to PDF passes PDFA_CONVERT_TO
+        when the visitor asks for an archive file.
+        """
         out_dir = os.path.join(self.dir, "lo-out")
         os.makedirs(out_dir, exist_ok=True)
         profile = os.path.join(LO_PROFILES_ROOT, f"slot-{self.slot}")
@@ -1801,7 +1807,7 @@ class Job:
             "--norestore",
             "--nolockcheck",
             "--convert-to",
-            "pdf",
+            convert_to,
             "--outdir",
             out_dir,
             os.path.join(self.dir, src_name),
@@ -2237,13 +2243,45 @@ def convert_pdf(
         )
 
 
+# PDF/A-2b through LibreOffice's own Writer export filter. SelectPdfVersion is
+# 1 for PDF/A-1b, 2 for PDF/A-2b and 3 for PDF/A-3b. PDF/A-2b is the version
+# journals and most registries ask for, and the only one that allows
+# transparency, which an ordinary document with a logo in it usually has.
+PDFA_CONVERT_TO = (
+    'pdf:writer_pdf_Export:{"SelectPdfVersion":{"type":"long","value":2}}'
+)
+
+
 @app.post("/api/word-to-pdf")
-def word_to_pdf(file: UploadFile = File(...)):
+def word_to_pdf(file: UploadFile = File(...), pdfa: str = Form("")):
+    want_pdfa = str(pdfa or "").strip().lower() in ("1", "true", "yes", "on")
     with Job("/api/word-to-pdf", file) as job:
         ext = safe_extension(file.filename, ".docx")
         job.start(ext)
-        job.libreoffice_to_pdf(f"input{ext}")
-        return job.file_response("output.pdf", PDF_TYPE, f"OptimaxPDF_WordToPDF_{job.base}.pdf")
+        notes = ""
+        if want_pdfa:
+            try:
+                job.libreoffice_to_pdf(f"input{ext}", PDFA_CONVERT_TO)
+            except ApiError as err:
+                # A build of LibreOffice that will not take the filter, or a
+                # document it cannot export that way. Falling back silently
+                # would hand back an ordinary PDF to somebody who asked for an
+                # archive file, so the conversion is redone and the reply says
+                # what happened. A timeout is a timeout and is not retried: a
+                # second full conversion would run past the job deadline.
+                if err.code == "timeout":
+                    raise
+                job.libreoffice_to_pdf(f"input{ext}")
+                notes = "pdfa_unavailable"
+        else:
+            job.libreoffice_to_pdf(f"input{ext}")
+        headers = {"X-Optimax-Notes": notes} if notes else None
+        return job.file_response(
+            "output.pdf",
+            PDF_TYPE,
+            f"OptimaxPDF_WordToPDF_{job.base}.pdf",
+            headers=headers,
+        )
 
 
 @app.post("/api/compress")

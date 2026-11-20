@@ -1,8 +1,12 @@
 # Optimax PDF API on Render (Docker web service).
 # Python version and the full LibreOffice install stay as they were. The move
 # to Python 3.12 and a slimmer LibreOffice is still the Backend upgrade step
-# (AUDIT.md 6.11 and 6.12). This change adds only the three metric compatible
-# font families, which the PDF to Word rebuild needs.
+# (AUDIT.md 6.11 and 6.12).
+#
+# 9 November 2026: the three metric compatible font families, which the PDF to
+# Word rebuild needs.
+# 20 November 2026: Noto and Noto Nastaliq Urdu, so documents in Arabic and
+# Urdu convert instead of coming back as empty boxes (AUDIT.md 3.9 and 6.12).
 FROM python:3.10-slim
 
 ENV PYTHONUNBUFFERED=1 \
@@ -16,16 +20,26 @@ ENV PYTHONUNBUFFERED=1 \
 # LibreOffice, the graphics libraries pdf2docx needs, and tini, a tiny init
 # process that cleans up any stopped child processes after a timeout.
 #
-# The three font packages are new (AUDIT.md 6.12, part of it):
+# The fonts, and why each one is here (AUDIT.md 6.12):
 #   fonts-liberation        Liberation Serif, Sans and Mono, which match the
 #                           metrics of Times New Roman, Arial and Courier New
 #   fonts-crosextra-carlito Carlito, which matches Calibri
 #   fonts-crosextra-caladea Caladea, which matches Cambria
-# PDF to Word maps PostScript font names onto exactly those four families, so
-# with these installed the server lays a page out the way Word will. They also
-# improve Word to PDF, which until now had no Microsoft compatible fonts at
-# all and reflowed every page (AUDIT.md 3.9). Arabic and Urdu fonts are still
-# missing and stay on the Backend upgrade list.
+#   fonts-noto-core         Noto, which covers Arabic and most other scripts
+#   fonts-noto-nastaliq-urdu
+#                           Nastaliq, the style Urdu is actually written in.
+#                           Without it Urdu falls back to an Arabic style that
+#                           reads wrongly to anyone who reads Urdu, so the
+#                           Arabic coverage above is not enough on its own.
+#
+# PDF to Word maps PostScript font names onto the first four families, so with
+# these installed the server lays a page out the way Word will. Word to PDF
+# gets the same benefit: until 9 November it had no Microsoft compatible fonts
+# at all and reflowed every page (AUDIT.md 3.9).
+#
+# The two Noto packages enlarge the image and so lengthen a cold start. Watch
+# the first deploy after adding them. fonts-noto-core is already the trimmed
+# package; fonts-noto, the full set, is far larger and is not worth it here.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     tesseract-ocr \
     tesseract-ocr-eng \
@@ -42,6 +56,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     fonts-liberation \
     fonts-crosextra-carlito \
     fonts-crosextra-caladea \
+    fonts-noto-core \
+    fonts-noto-nastaliq-urdu \
     libgl1 \
     libglib2.0-0 \
     tini \
