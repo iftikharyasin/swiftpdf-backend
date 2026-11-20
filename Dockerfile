@@ -6,7 +6,8 @@
 # 9 November 2026: the three metric compatible font families, which the PDF to
 # Word rebuild needs.
 # 20 November 2026: fonts-noto-core, so documents in Arabic and Urdu convert
-# instead of coming back as empty boxes (AUDIT.md 3.9 and 6.12).
+# instead of coming back as empty boxes (AUDIT.md 3.9 and 6.12), plus a
+# fontconfig rule so Urdu comes out in Nastaliq rather than Kufi.
 FROM python:3.10-slim
 
 ENV PYTHONUNBUFFERED=1 \
@@ -62,6 +63,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     tini \
     && fc-cache -f \
     && rm -rf /var/lib/apt/lists/*
+
+# Urdu comes out in Kufi without this. fonts-noto-core carries Nastaliq, Naskh
+# and Kufi, all covering the Arabic script, so fontconfig was free to answer an
+# Urdu request with the squared display face. 99 so it runs last and wins.
+COPY urdu-nastaliq.conf /etc/fonts/conf.d/99-urdu-nastaliq.conf
+RUN fc-cache -f
 
 WORKDIR /app
 
