@@ -180,7 +180,10 @@ TOOL_LIMITS = {
     "/api/compress": (50, 120),
     "/api/protect": (30, 60),
     "/api/unlock": (30, 60),
-    "/api/ocr": (10, 180),
+    # 15 MB since the OCR rebuild of 21 November, to match the page and
+    # iLovePDF. Safe because the default mode no longer rasterises pages that
+    # already hold text, which was the memory cost on every job.
+    "/api/ocr": (15, 180),
     "/api/excel-to-pdf": (20, 120),
     "/api/ppt-to-pdf": (20, 120),
     "/api/pdf-to-excel": (20, 180),
@@ -202,6 +205,60 @@ MULTIPART_SLACK_BYTES = 1 * MB
 WORKER_FILE = os.path.abspath(__file__)
 
 OCR_LANGUAGE_PATTERN = re.compile(r"[a-z_]{3,10}(\+[a-z_]{3,10}){0,4}")
+
+# OCR PDF (AUDIT.md 6.14). Modes and output types the page may ask for.
+# An unknown value falls back to what this server did before the patch, so a
+# page that has not been updated is unaffected.
+OCR_MODES = ("skip", "redo", "force")
+OCR_OUTPUTS = ("pdfa", "pdf")
+
+# Tesseract ships these two as data files, but neither is a language: osd is
+# orientation and script detection, equ is the equation model.
+OCR_NOT_A_LANGUAGE = frozenset({"osd", "equ"})
+
+# At most this many languages in one pass. Each one Tesseract loads costs
+# memory, and the free tier has 512 MB for everything.
+OCR_MAX_LANGUAGES = 3
+
+_ocr_languages_cache = None
+
+
+def ocr_languages() -> tuple:
+    """The language packs Tesseract actually has, asked of Tesseract itself.
+
+    Read once and kept. Guessing from a list in the code would drift from the
+    image the moment the Dockerfile changed, which is exactly the fault this
+    closes: a language the page offered and the server did not have failed
+    only after a full upload.
+    """
+    global _ocr_languages_cache
+    if _ocr_languages_cache is None:
+        found = []
+        try:
+            answer = subprocess.run(
+                ["tesseract", "--list-langs"],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+            # Tesseract prints a header line with spaces in it, then one code
+            # per line. Some builds print the whole thing on stderr.
+            for line in ((answer.stdout or "") + "\n" + (answer.stderr or "")).splitlines():
+                code = line.strip()
+                if code and " " not in code and ":" not in code and code not in OCR_NOT_A_LANGUAGE:
+                    found.append(code)
+        except Exception:  # noqa: BLE001 - a missing binary must not stop the server
+            found = []
+        _ocr_languages_cache = tuple(sorted(set(found))) or ("eng",)
+        # `log` belongs to the API process, which is defined further down this
+        # file. The worker child exits before that line is ever reached, so
+        # the logger is asked for rather than assumed.
+        logger = globals().get("log")
+        if logger is not None:
+            logger.info("ocr languages=%d", len(_ocr_languages_cache))
+    return _ocr_languages_cache
+
 
 CONVERT_MODES = ("editable", "layout")
 PAGE_RANGE_PATTERN = re.compile(r"^\s*\d{1,5}(\s*-\s*\d{1,5})?(\s*,\s*\d{1,5}(\s*-\s*\d{1,5})?)*\s*$")
@@ -1364,28 +1421,76 @@ def _ocrmypdf_error_to_api(exc: Exception, encrypted_status: int) -> ApiError:
 def task_ocr(job_dir: str, params: dict) -> dict:
     src = os.path.join(job_dir, "input.pdf")
     out = os.path.join(job_dir, "output.pdf")
+    sidecar = os.path.join(job_dir, "output.txt")
 
     pages = _check_pdf(src, 403, reject_any_encryption=True)
     _check_page_cap(pages, int(params.get("max_pages") or 0))
 
     import ocrmypdf
 
+    # No mode is the behaviour this server has always had, so an older page
+    # gets exactly the file it got yesterday.
+    mode = params.get("mode") or "force"
+
+    options = {
+        "language": params.get("language", "eng"),
+        "optimize": 0,
+        "jobs": 1,
+        "skip_big": 10.0,
+        # OCRmyPDF's own default is already pdfa. Saying so makes the output
+        # a decision rather than an accident of the library's defaults.
+        "output_type": params.get("output") or "pdfa",
+    }
+    if mode == "skip":
+        # Pages that already hold real text are copied through untouched, so
+        # their text stays vector and the file does not grow.
+        options["skip_text"] = True
+    elif mode == "redo":
+        options["redo_ocr"] = True
+    else:
+        options["force_ocr"] = True
+
+    # Image clean up. OCRmyPDF refuses every one of these alongside redo_ocr,
+    # because that mode works by comparing the page with what is drawn on it.
+    # Dropping them here means a page that asks anyway gets a result instead
+    # of a failed job.
+    if mode != "redo":
+        if params.get("rotate"):
+            options["rotate_pages"] = True
+        if params.get("deskew"):
+            options["deskew"] = True
+        if params.get("background"):
+            options["remove_background"] = True
+        if params.get("clean"):
+            options["clean"] = True
+
+    page_range = params.get("pages") or ""
+    if page_range:
+        options["pages"] = page_range
+
+    want_text = bool(params.get("want_text"))
+    if want_text:
+        options["sidecar"] = sidecar
+
     try:
-        ocrmypdf.ocr(
-            src,
-            out,
-            language=params.get("language", "eng"),
-            force_ocr=True,
-            optimize=0,
-            jobs=1,
-            skip_big=10.0,
-        )
+        ocrmypdf.ocr(src, out, **options)
     except MemoryError:
         raise
     except Exception as exc:
         raise _ocrmypdf_error_to_api(exc, 403)
 
     _require_output(out)
+
+    if want_text and os.path.exists(sidecar):
+        import zipfile
+
+        bundle = os.path.join(job_dir, "output.zip")
+        with zipfile.ZipFile(bundle, "w", zipfile.ZIP_DEFLATED) as archive:
+            archive.write(out, "searchable.pdf")
+            archive.write(sidecar, "text.txt")
+        _require_output(bundle)
+        return {"zipped": True}
+
     return {}
 
 
@@ -2394,12 +2499,66 @@ def unlock_pdf(file: UploadFile = File(...), password: str = Form("")):
 
 
 @app.post("/api/ocr")
-def ocr_pdf(file: UploadFile = File(...), language: str = Form("eng")):
+def ocr_pdf(
+    file: UploadFile = File(...),
+    language: str = Form("eng"),
+    mode: str = Form(""),
+    rotate: bool = Form(False),
+    deskew: bool = Form(False),
+    background: bool = Form(False),
+    clean: bool = Form(False),
+    pages: str = Form(""),
+    output: str = Form(""),
+    want_text: bool = Form(False),
+):
+    """OCR PDF.
+
+    Every field but `file` and `language` is new and optional. A request that
+    sends neither gets the same job, the same settings and the same file name
+    the old page received.
+    """
     with Job("/api/ocr", file) as job:
         if not OCR_LANGUAGE_PATTERN.fullmatch(language or ""):
             raise ApiError(400, "bad_language")
+
+        # Checked against the packs this image actually holds, rather than
+        # against a shape (AUDIT.md 6.14). A language we do not have is
+        # refused here, before the upload is turned into a job.
+        wanted = [code for code in (language or "eng").split("+") if code]
+        have = set(ocr_languages())
+        if not wanted or len(wanted) > OCR_MAX_LANGUAGES or any(code not in have for code in wanted):
+            raise ApiError(400, "bad_language")
+
+        chosen_mode = (mode or "").strip().lower()
+        chosen_mode = chosen_mode if chosen_mode in OCR_MODES else "force"
+
+        chosen_output = (output or "").strip().lower()
+        chosen_output = chosen_output if chosen_output in OCR_OUTPUTS else "pdfa"
+
+        page_range = (pages or "").strip()
+        if page_range and not PAGE_RANGE_PATTERN.fullmatch(page_range):
+            raise ApiError(400, "bad_pages")
+
         job.start(".pdf")
-        job.run_worker("ocr", {"language": language, "max_pages": MAX_PAGES_OCR})
+        result = job.run_worker(
+            "ocr",
+            {
+                "language": language,
+                "max_pages": MAX_PAGES_OCR,
+                "mode": chosen_mode,
+                "rotate": bool(rotate),
+                "deskew": bool(deskew),
+                "background": bool(background),
+                "clean": bool(clean),
+                "pages": page_range,
+                "output": chosen_output,
+                "want_text": bool(want_text),
+            },
+        )
+        if result.get("zipped"):
+            return job.file_response(
+                "output.zip", "application/zip", f"OptimaxPDF_Searchable_{job.base}.zip"
+            )
         return job.file_response("output.pdf", PDF_TYPE, f"OptimaxPDF_Searchable_{job.base}.pdf")
 
 
@@ -2475,7 +2634,7 @@ async def health():
     # convert_soft_pages is the page count above which PDF to Word warns that
     # a file will take a few minutes. The page keeps its own default in
     # config.js and prefers this value when it has it, so the two cannot drift.
-    return {
+    return {"ocr_languages": list(ocr_languages()),
         "status": "ok",
         "convert_soft_pages": CONVERT_SOFT_PAGES,
         "merge_max_files": MAX_FILES_MERGE,
