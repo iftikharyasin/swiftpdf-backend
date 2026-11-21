@@ -1199,6 +1199,42 @@ def task_compress(job_dir: str, params: dict) -> dict:
     return {}
 
 
+# The permission flags Protect PDF may send, in pikepdf's own names so the
+# page and the server cannot drift apart. accessibility is deliberately not
+# here: clearing it stops a screen reader reading the file to a blind person,
+# every reader ignores it, and the page offers no switch for it.
+PROTECT_PERMISSIONS = (
+    "print_lowres",
+    "print_highres",
+    "extract",
+    "modify_other",
+    "modify_annotation",
+    "modify_form",
+    "modify_assembly",
+)
+
+
+def _permissions_from(params: dict):
+    """A pikepdf.Permissions, or None when nothing was restricted.
+
+    None means the file is saved exactly as it was before this patch existed.
+    """
+    import pikepdf
+
+    chosen = {}
+    for name in PROTECT_PERMISSIONS:
+        value = params.get(name)
+        if value is None:
+            continue
+        chosen[name] = str(value).strip().lower() in ("1", "true", "yes", "on")
+    if not chosen or all(chosen.values()):
+        return None
+    allowed = {name: chosen.get(name, True) for name in PROTECT_PERMISSIONS}
+    # Always granted. See the note above.
+    allowed["accessibility"] = True
+    return pikepdf.Permissions(**allowed)
+
+
 def task_protect(job_dir: str, params: dict) -> dict:
     import pikepdf
 
@@ -1206,17 +1242,35 @@ def task_protect(job_dir: str, params: dict) -> dict:
     out = os.path.join(job_dir, "output.pdf")
 
     clean_password = (params.get("password") or "").strip()
-    if not clean_password:
+    # The open password and the owner password, when the page sends them
+    # separately. The page may send an owner password with no open password,
+    # which makes a file anyone can read but nobody can print or copy.
+    user_password = (params.get("user_password") or "").strip()
+    owner_password = (params.get("owner_password") or "").strip()
+    allow = _permissions_from(params)
+
+    if not clean_password and not user_password and not owner_password:
         raise ApiError(400, "bad_request", "Password cannot be empty.")
+
+    if user_password or owner_password:
+        user = user_password
+        # Restrictions are enforced by the owner password, so without one they
+        # would be lifted by any reader in a click. Fall back to the open
+        # password, which is what this endpoint always did.
+        owner = owner_password or user_password
+    else:
+        user = owner = clean_password
 
     try:
         with pikepdf.open(src) as pdf:
             if pdf.is_encrypted:
                 raise ApiError(400, "encrypted", MESSAGES["already_encrypted"])
-            pdf.save(
-                out,
-                encryption=pikepdf.Encryption(user=clean_password, owner=clean_password, R=6),
+            encryption = (
+                pikepdf.Encryption(user=user, owner=owner, R=6, allow=allow)
+                if allow is not None
+                else pikepdf.Encryption(user=user, owner=owner, R=6)
             )
+            pdf.save(out, encryption=encryption)
     except pikepdf.PasswordError:
         raise ApiError(400, "encrypted", MESSAGES["already_encrypted"])
     except ApiError:
@@ -2293,12 +2347,41 @@ def compress_pdf(file: UploadFile = File(...), level: str = Form("medium")):
 
 
 @app.post("/api/protect")
-def protect_pdf(file: UploadFile = File(...), password: str = Form(...)):
+def protect_pdf(
+    file: UploadFile = File(...),
+    password: str = Form(...),
+    user_password: str = Form(""),
+    owner_password: str = Form(""),
+    print_lowres: str = Form(""),
+    print_highres: str = Form(""),
+    extract: str = Form(""),
+    modify_other: str = Form(""),
+    modify_annotation: str = Form(""),
+    modify_form: str = Form(""),
+    modify_assembly: str = Form(""),
+):
+    """Protect PDF.
+
+    Everything past `password` is optional and new. A request that sends only
+    `file` and `password`, which is what the old page sends, takes exactly the
+    path it always took.
+    """
     with Job("/api/protect", file) as job:
-        if not password.strip():
+        if not password.strip() and not user_password.strip() and not owner_password.strip():
             raise ApiError(400, "bad_request", "Password cannot be empty.")
         job.start(".pdf")
-        job.run_worker("protect", {"password": password})
+        job.run_worker("protect", {
+            "password": password,
+            "user_password": user_password,
+            "owner_password": owner_password,
+            "print_lowres": print_lowres,
+            "print_highres": print_highres,
+            "extract": extract,
+            "modify_other": modify_other,
+            "modify_annotation": modify_annotation,
+            "modify_form": modify_form,
+            "modify_assembly": modify_assembly,
+        })
         return job.file_response("output.pdf", PDF_TYPE, f"OptimaxPDF_Protected_{job.base}.pdf")
 
 
