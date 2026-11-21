@@ -98,7 +98,12 @@ def ocr_languages() -> tuple:
         except Exception:  # noqa: BLE001 - a missing binary must not stop the server
             found = []
         _ocr_languages_cache = tuple(sorted(set(found))) or ("eng",)
-        log.info("ocr languages=%d", len(_ocr_languages_cache))
+        # `log` belongs to the API process, which is defined further down this
+        # file. The worker child exits before that line is ever reached, so
+        # the logger is asked for rather than assumed.
+        logger = globals().get("log")
+        if logger is not None:
+            logger.info("ocr languages=%d", len(_ocr_languages_cache))
     return _ocr_languages_cache
 '''
 
@@ -212,6 +217,13 @@ NEW_TASK_OCR = '''def task_ocr(job_dir: str, params: dict) -> dict:
 # 3. The endpoint
 # ---------------------------------------------------------------------------
 
+OLD_SIZE_LIMIT = '''    "/api/ocr": (10, 180),'''
+
+NEW_SIZE_LIMIT = '''    # 15 MB since the OCR rebuild of 21 November, to match the page and
+    # iLovePDF. Safe because the default mode no longer rasterises pages that
+    # already hold text, which was the memory cost on every job.
+    "/api/ocr": (15, 180),'''
+
 OLD_ENDPOINT = '''@app.post("/api/ocr")
 def ocr_pdf(file: UploadFile = File(...), language: str = Form("eng")):
     with Job("/api/ocr", file) as job:
@@ -288,16 +300,32 @@ def ocr_pdf(
 # 4. /health reports the installed languages
 # ---------------------------------------------------------------------------
 
-OLD_HEALTH = '''    return {"status": "ok", "convert_soft_pages": CONVERT_SOFT_PAGES}'''
+HEALTH_DEF = "async def health():"
+HEALTH_KEY = '"ocr_languages": list(ocr_languages()), '
 
-NEW_HEALTH = '''    # ocr_languages is what Tesseract reports in this image. The OCR page
-    # builds its language picker from it, so the page cannot offer a language
-    # the server would refuse.
-    return {
-        "status": "ok",
-        "convert_soft_pages": CONVERT_SOFT_PAGES,
-        "ocr_languages": list(ocr_languages()),
-    }'''
+
+def patch_health(source: str) -> str:
+    """Add ocr_languages to whatever dict /health already returns.
+
+    This one is done by hand rather than by exact text, because /health has
+    picked up a field or two since this patch was written and will pick up
+    more. The transformation is narrow: find the first `return {` inside
+    `async def health()` and put one key straight after the brace. It works
+    whether the dict is written on one line or several, and it keeps every
+    field already there.
+    """
+    if source.count(HEALTH_DEF) != 1:
+        raise LookupError(
+            f"expected exactly one '{HEALTH_DEF}' and found {source.count(HEALTH_DEF)}"
+        )
+    start = source.index(HEALTH_DEF)
+    brace = source.find("return {", start)
+    if brace == -1 or brace - start > 1200:
+        raise LookupError("could not find a 'return {' inside async def health()")
+    cut = brace + len("return {")
+    # No trailing space when the dict carries on to the next line.
+    key = HEALTH_KEY.rstrip() if source[cut:cut + 1] == "\n" else HEALTH_KEY
+    return source[:cut] + key + source[cut:]
 
 
 def fail(message: str) -> None:
@@ -327,8 +355,8 @@ def main() -> None:
         missing.append("task_ocr as it was before this patch")
     if OLD_ENDPOINT not in source:
         missing.append("the /api/ocr endpoint as it was before this patch")
-    if OLD_HEALTH not in source:
-        missing.append("the /health reply as it was before this patch")
+    if OLD_SIZE_LIMIT not in source:
+        missing.append("the /api/ocr size limit as it was before this patch")
     if missing:
         fail(
             "This does not look like the server.py this patch was written for.\n"
@@ -338,8 +366,12 @@ def main() -> None:
 
     patched = source.replace(ANCHOR_PATTERN, ANCHOR_PATTERN + LANGUAGES_BLOCK, 1)
     patched = patched.replace(OLD_TASK_OCR, NEW_TASK_OCR, 1)
+    patched = patched.replace(OLD_SIZE_LIMIT, NEW_SIZE_LIMIT, 1)
     patched = patched.replace(OLD_ENDPOINT, NEW_ENDPOINT, 1)
-    patched = patched.replace(OLD_HEALTH, NEW_HEALTH, 1)
+    try:
+        patched = patch_health(patched)
+    except LookupError as err:
+        fail(f"The /health endpoint is not the shape this patch can edit ({err}).")
 
     try:
         compile(patched, path, "exec")
@@ -352,7 +384,17 @@ def main() -> None:
 
     print(f"Patched {path}. The file as it was is saved as {path}.bak.")
     print("Changed: language discovery from Tesseract, reading modes, image clean up,")
-    print("page range, PDF/A or standard PDF, a text file beside the PDF, and /health.")
+    print("page range, PDF/A or standard PDF, a text file beside the PDF, /health,")
+    print("and the /api/ocr size limit, now 15 MB to match the page.")
+    print()
+    print("Your /health now reads:")
+    start = patched.index(HEALTH_DEF)
+    for line in patched[start:].splitlines()[:12]:
+        print("    " + line)
+        if line.strip().endswith("}") and "return" not in line:
+            break
+    print()
+    print("Please paste those lines back to me so the change is on record.")
 
 
 if __name__ == "__main__":
