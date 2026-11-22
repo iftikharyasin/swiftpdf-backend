@@ -506,11 +506,22 @@ STEPS = [
 
 
 def replace_worker(source: str) -> str:
-    """Swap the whole of task_pdf_to_excel for the new workers."""
+    """Swap the whole of task_pdf_to_excel for the new workers.
+
+    The end marker is the definition that immediately follows
+    task_pdf_to_excel, not the next one this patch happens to know the name
+    of. The first version of this function cut as far as task_excel_prepare,
+    and thirteen other definitions sat in between, all of which it silently
+    deleted: office_flag, _column_letter, excel_sheet_width_points,
+    excel_clean_options and the nine EXCEL_* constants. Python only
+    complains about a missing name when the line runs, so the file still
+    compiled, the build went green, and two endpoints answered 500 on every
+    request. Cutting to the next definition is the whole fix.
+    """
     start_marker = "def task_pdf_to_excel(job_dir: str, params: dict) -> dict:"
-    end_marker = "\ndef task_excel_prepare(job_dir: str, params: dict) -> dict:"
+    end_marker = "\ndef office_flag(value) -> bool:"
     if source.count(start_marker) != 1 or source.count(end_marker) != 1:
-        raise LookupError("task_pdf_to_excel as it was before this patch")
+        raise LookupError("task_pdf_to_excel followed by office_flag, as the office patch leaves them")
     start = source.index(start_marker)
     end = source.index(end_marker)
     if end < start:
