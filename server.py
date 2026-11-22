@@ -1,3 +1,4 @@
+# OPTIMAX_EXTRACT_V1: PDF to Excel options and PDF to PowerPoint, 22 November 2026.
 # OPTIMAX_OFFICE_OPTIONS_V1: Excel and PowerPoint conversion options, 22 November 2026.
 """Optimax PDF API (server.py).
 
@@ -188,6 +189,7 @@ TOOL_LIMITS = {
     "/api/excel-to-pdf": (20, 180),
     "/api/ppt-to-pdf": (20, 180),
     "/api/pdf-to-excel": (20, 180),
+    "/api/pdf-to-ppt": (20, 180),
     # Merge PDF. The page merges in the browser by default and only sends a
     # job here when the batch is too big for a browser to merge comfortably
     # (TOOLS.md, merge-pdf). Combining pages is cheap CPU-wise, so the limit
@@ -1495,14 +1497,209 @@ def task_ocr(job_dir: str, params: dict) -> dict:
     return {}
 
 
-def task_pdf_to_excel(job_dir: str, params: dict) -> dict:
-    import pandas as pd
+MAX_PREVIEW_TABLES = 20
+MAX_PREVIEW_ROWS = 5
+MAX_PREVIEW_COLUMNS = 8
+EXTRACT_SHEET_MODES = ("one", "page", "table")
+EXTRACT_OUTPUTS = ("xlsx", "csv")
+EXTRACT_MAX_LANGUAGES = 3
+EXTRACT_LANG_RE = re.compile(r"^[a-z]{3}(_[a-z]{4,5})?$")
+EXTRACT_RANGE_RE = re.compile(r"^[0-9]+(-[0-9]+)?(,[0-9]+(-[0-9]+)?)*$")
+
+
+def expand_page_range(text, total):
+    """"1-3,7" into [1, 2, 3, 7], bounded by the document.
+
+    None means every page, which is also what an unreadable range gives: a
+    malformed box converts the whole file rather than failing the job.
+    """
+    squeezed = re.sub(r"\s+", "", str(text or ""))
+    if not squeezed or len(squeezed) > 200 or not EXTRACT_RANGE_RE.match(squeezed):
+        return None
+    wanted = set()
+    for part in squeezed.split(","):
+        if "-" in part:
+            first, last = part.split("-", 1)
+            first, last = int(first), int(last)
+            if first > last:
+                first, last = last, first
+        else:
+            first = last = int(part)
+        for number in range(max(1, first), min(int(total), last) + 1):
+            wanted.add(number)
+    return sorted(wanted) or None
+
+
+def clean_ocr_languages(text):
+    """A Tesseract language string we are willing to run, or English."""
+    parts = [p for p in re.split(r"[+,\s]+", str(text or "").lower()) if p]
+    good = [p for p in parts if EXTRACT_LANG_RE.match(p)][:EXTRACT_MAX_LANGUAGES]
+    return "+".join(good) if good else "eng"
+
+
+def safe_sheet_name(name, used):
+    """Excel refuses [ ] : * ? / \\ and anything over 31 characters."""
+    clean = re.sub(r"[\[\]:*?/\\]", " ", str(name)).strip()[:31] or "Sheet"
+    candidate = clean
+    counter = 2
+    while candidate.lower() in used:
+        suffix = f" {counter}"
+        candidate = clean[: 31 - len(suffix)] + suffix
+        counter += 1
+    used.add(candidate.lower())
+    return candidate
+
+
+def _unique_header(row):
+    """pandas refuses duplicate column names; a PDF header often has them."""
+    out, seen = [], {}
+    for index, cell in enumerate(row):
+        name = str(cell).strip() or f"Column {index + 1}"
+        if name in seen:
+            seen[name] += 1
+            name = f"{name} {seen[name]}"
+        else:
+            seen[name] = 1
+        out.append(name)
+    return out
+
+
+def _collect_tables(path, page_numbers):
+    """Every table found, as (page number, rows). The two strategies, and the
+    cleaning, are exactly what this tool has always used."""
     import pdfplumber
 
-    src = os.path.join(job_dir, "input.pdf")
-    out = os.path.join(job_dir, "output.xlsx")
+    found = []
+    with pdfplumber.open(path) as pdf:
+        for index, page in enumerate(pdf.pages, 1):
+            if page_numbers and index not in page_numbers:
+                continue
+            tables = page.extract_tables()
+            if not tables:
+                tables = page.extract_tables({
+                    "vertical_strategy": "text",
+                    "horizontal_strategy": "text",
+                    "intersection_y_tolerance": 15,
+                })
+            for table in tables:
+                rows = []
+                for row in table:
+                    cleaned = [cell.replace("\n", " ") if cell is not None else "" for cell in row]
+                    if any(cell.strip() for cell in cleaned):
+                        rows.append(cleaned)
+                if rows:
+                    found.append((index, rows))
+    return found
 
+
+def _group_tables(found, mode):
+    """[(sheet name, rows)] for the chosen layout."""
+    if mode == "table":
+        return [(f"Table {i}", rows) for i, (_, rows) in enumerate(found, 1)]
+    if mode == "page":
+        by_page = {}
+        for page, rows in found:
+            if page in by_page:
+                by_page[page].append([])  # a blank line between tables
+            else:
+                by_page[page] = []
+            by_page[page].extend(rows)
+        return [(f"Page {page}", rows) for page, rows in sorted(by_page.items())]
+    # One sheet, which is what this tool has always produced. The sheet name
+    # is kept so anything scripted against the old output still finds it.
+    flat = []
+    for _, rows in found:
+        flat.extend(rows)
+    return [("Table_Data", flat)]
+
+
+def _write_tables_xlsx(path, groups, header_row):
+    import pandas as pd
+    from openpyxl.styles import Font
+    from openpyxl.utils import get_column_letter
+
+    with pd.ExcelWriter(path, engine="openpyxl") as writer:
+        used = set()
+        for name, rows in groups:
+            if not rows:
+                continue
+            sheet_name = safe_sheet_name(name, used)
+            as_header = bool(header_row) and len(rows) > 1
+            if as_header:
+                frame = pd.DataFrame(rows[1:], columns=_unique_header(rows[0]))
+                frame.to_excel(writer, sheet_name=sheet_name, index=False)
+            else:
+                pd.DataFrame(rows).to_excel(writer, sheet_name=sheet_name, index=False, header=False)
+
+            sheet = writer.sheets[sheet_name]
+            width = max((len(row) for row in rows), default=0)
+            if as_header and width:
+                # Writing the first row as column names and writing it as
+                # data give a byte identical sheet, so without this the
+                # option would be a control that does nothing.
+                for cell in sheet[1]:
+                    cell.font = Font(bold=True)
+                sheet.freeze_panes = "A2"
+                sheet.auto_filter.ref = f"A1:{get_column_letter(width)}{sheet.max_row}"
+            for index in range(1, width + 1):
+                longest = max(
+                    (len(str(row[index - 1])) for row in rows if index <= len(row)),
+                    default=0,
+                )
+                sheet.column_dimensions[get_column_letter(index)].width = min(60, max(9, longest + 2))
+
+
+class _CsvSink:
+    """csv.writer needs something with write(); this keeps it in memory."""
+
+    def __init__(self, store):
+        self.store = store
+
+    def write(self, text):
+        self.store.append(text)
+
+
+def _write_tables_csv(job_dir, groups):
+    """One CSV, or a ZIP of them. Returns the file name written."""
+    import csv
+    import zipfile
+
+    if len(groups) <= 1:
+        out = os.path.join(job_dir, "output.csv")
+        # utf-8-sig, so Excel on Windows opens accented text correctly.
+        with open(out, "w", newline="", encoding="utf-8-sig") as handle:
+            writer = csv.writer(handle)
+            for row in (groups[0][1] if groups else []):
+                writer.writerow(row)
+        return "output.csv"
+
+    out = os.path.join(job_dir, "output.zip")
+    used = set()
+    with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as bundle:
+        for name, rows in groups:
+            if not rows:
+                continue
+            buffer = []
+            writer = csv.writer(_CsvSink(buffer))
+            for row in rows:
+                writer.writerow(row)
+            bundle.writestr(f"{safe_sheet_name(name, used)}.csv", "".join(buffer).encode("utf-8-sig"))
+    return "output.zip"
+
+
+def task_pdf_to_excel(job_dir: str, params: dict) -> dict:
+    src = os.path.join(job_dir, "input.pdf")
     pages = _check_pdf(src, 400)
+
+    mode = str(params.get("sheets") or "one").lower()
+    if mode not in EXTRACT_SHEET_MODES:
+        mode = "one"
+    output = str(params.get("output") or "xlsx").lower()
+    if output not in EXTRACT_OUTPUTS:
+        output = "xlsx"
+    header_row = str(params.get("header_row") or "").strip().lower() in ("1", "true", "yes", "on")
+    wanted_pages = expand_page_range(params.get("pages"), pages)
+    preview_only = str(params.get("preview") or "").strip().lower() in ("1", "true", "yes", "on")
 
     target = src
     if params.get("ocr"):
@@ -1514,7 +1711,7 @@ def task_pdf_to_excel(job_dir: str, params: dict) -> dict:
             ocrmypdf.ocr(
                 src,
                 ocr_out,
-                language="eng",
+                language=clean_ocr_languages(params.get("languages")),
                 force_ocr=True,
                 optimize=0,
                 jobs=1,
@@ -1528,142 +1725,70 @@ def task_pdf_to_excel(job_dir: str, params: dict) -> dict:
             # Same as before: if OCR fails, extract from the original file.
             target = src
 
-    all_rows = []
-    with pdfplumber.open(target) as pdf:
-        for page in pdf.pages:
-            tables = page.extract_tables()
-            if not tables:
-                tables = page.extract_tables({
-                    "vertical_strategy": "text",
-                    "horizontal_strategy": "text",
-                    "intersection_y_tolerance": 15,
-                })
-            for table in tables:
-                for row in table:
-                    cleaned = [cell.replace("\n", " ") if cell is not None else "" for cell in row]
-                    if any(cell.strip() for cell in cleaned):
-                        all_rows.append(cleaned)
+    found = _collect_tables(target, wanted_pages)
 
-    if not all_rows:
+    if preview_only:
+        # No file is written, so the job does not stream anything and its
+        # directory is cleared on the way out.
+        return {
+            "preview": {
+                "pages": pages,
+                "truncated": len(found) > MAX_PREVIEW_TABLES,
+                "tables": [
+                    {
+                        "page": page,
+                        "total_rows": len(rows),
+                        "total_columns": max((len(r) for r in rows), default=0),
+                        "rows": [row[:MAX_PREVIEW_COLUMNS] for row in rows[:MAX_PREVIEW_ROWS]],
+                    }
+                    for page, rows in found[:MAX_PREVIEW_TABLES]
+                ],
+            }
+        }
+
+    if not found:
         raise ApiError(400, "no_tables")
 
-    frame = pd.DataFrame(all_rows)
-    with pd.ExcelWriter(out, engine="openpyxl") as writer:
-        frame.to_excel(writer, sheet_name="Table_Data", index=False, header=False)
+    groups = _group_tables(found, mode)
+    if output == "csv":
+        name = _write_tables_csv(job_dir, groups)
+    else:
+        name = "output.xlsx"
+        _write_tables_xlsx(os.path.join(job_dir, name), groups, header_row)
 
+    _require_output(os.path.join(job_dir, name))
+    return {"file": name, "tables": len(found)}
+
+
+def task_pdf_subset(job_dir: str, params: dict) -> dict:
+    """Write <job_dir>/subset.pdf holding only the pages asked for.
+
+    PDF to PowerPoint needs this because the Draw import filter has no page
+    range option of its own. If the range cannot be read, nothing is written
+    and the whole document is converted.
+    """
+    from pypdf import PdfReader, PdfWriter
+
+    src = os.path.join(job_dir, "input.pdf")
+    try:
+        reader = PdfReader(src)
+    except Exception:
+        raise ApiError(422, "corrupt")
+    if reader.is_encrypted:
+        raise ApiError(403, "encrypted")
+
+    wanted = expand_page_range(params.get("pages"), len(reader.pages))
+    if not wanted:
+        return {}
+
+    writer = PdfWriter()
+    for number in wanted:
+        writer.add_page(reader.pages[number - 1])
+    out = os.path.join(job_dir, "subset.pdf")
+    with open(out, "wb") as handle:
+        writer.write(handle)
     _require_output(out)
-    return {}
-
-
-def office_flag(value) -> bool:
-    """A form field that means yes."""
-    return str(value or "").strip().lower() in ("1", "true", "yes", "on")
-
-
-# Excel's column width is in characters of the default font. The usual
-# conversion is pixels = width * 7 + 5, and a PDF point is 0.75 of a pixel at
-# 96 dpi. It is an estimate, and it only has to be good enough to tell a
-# narrow sheet from a wide one.
-EXCEL_PX_PER_CHAR = 7.0
-EXCEL_PX_PADDING = 5.0
-EXCEL_PT_PER_PX = 0.75
-EXCEL_DEFAULT_COL_CHARS = 8.43
-
-# Printable width in points: the paper less normal margins. Used by the
-# automatic orientation rule and nothing else.
-EXCEL_PORTRAIT_PRINTABLE = {"a4": 494.0, "letter": 511.0, "legal": 511.0, "a3": 741.0}
-EXCEL_PAPER_CODES = {"a4": "9", "letter": "1", "legal": "5", "a3": "8"}
-EXCEL_MARGIN_SETS = {
-    "normal": (0.7, 0.7, 0.75, 0.75),
-    "narrow": (0.25, 0.25, 0.75, 0.75),
-    "wide": (1.0, 1.0, 1.0, 1.0),
-    "none": (0.0, 0.0, 0.0, 0.0),
-}
-EXCEL_FITS = ("width", "page", "actual", "scale")
-EXCEL_ORIENTATIONS = ("auto", "portrait", "landscape")
-
-
-def _column_letter(index: int) -> str:
-    letters = ""
-    while index > 0:
-        index, rest = divmod(index - 1, 26)
-        letters = chr(65 + rest) + letters
-    return letters
-
-
-def excel_sheet_width_points(sheet) -> float:
-    """Roughly how wide this sheet's used columns print, in points."""
-    last = sheet.max_column or 0
-    if not last:
-        return 0.0
-    try:
-        fallback = float(sheet.sheet_format.defaultColWidth or EXCEL_DEFAULT_COL_CHARS)
-    except (TypeError, ValueError):
-        fallback = EXCEL_DEFAULT_COL_CHARS
-    if fallback <= 0:
-        fallback = EXCEL_DEFAULT_COL_CHARS
-
-    total_px = 0.0
-    for index in range(1, last + 1):
-        dim = sheet.column_dimensions.get(_column_letter(index))
-        if dim is not None and getattr(dim, "hidden", False):
-            continue
-        chars = fallback
-        if dim is not None and dim.width:
-            try:
-                chars = float(dim.width)
-            except (TypeError, ValueError):
-                chars = fallback
-        total_px += chars * EXCEL_PX_PER_CHAR + EXCEL_PX_PADDING
-    return total_px * EXCEL_PT_PER_PX
-
-
-def excel_clean_options(params: dict) -> dict:
-    """Only values this module knows about get through. Anything else falls
-    back to the default, so a malformed field converts rather than fails."""
-    import json as _json
-
-    orientation = str(params.get("orientation") or "auto").lower()
-    if orientation not in EXCEL_ORIENTATIONS:
-        orientation = "auto"
-    fit = str(params.get("fit") or "width").lower()
-    if fit not in EXCEL_FITS:
-        fit = "width"
-    paper = str(params.get("paper") or "a4").lower()
-    if paper not in EXCEL_PAPER_CODES:
-        paper = "a4"
-    margins = str(params.get("margins") or "normal").lower()
-    if margins not in EXCEL_MARGIN_SETS:
-        margins = "normal"
-    try:
-        scale = int(float(params.get("scale") or 100))
-    except (TypeError, ValueError):
-        scale = 100
-    scale = max(10, min(400, scale))
-
-    raw = params.get("sheets")
-    keep = None
-    if isinstance(raw, str) and raw.strip():
-        try:
-            parsed = _json.loads(raw)
-        except ValueError:
-            parsed = None
-        if isinstance(parsed, list):
-            keep = [str(name) for name in parsed if str(name)]
-    elif isinstance(raw, list):
-        keep = [str(name) for name in raw if str(name)]
-
-    return {
-        "orientation": orientation,
-        "fit": fit,
-        "paper": paper,
-        "margins": margins,
-        "scale": scale,
-        "gridlines": office_flag(params.get("gridlines")),
-        "headings": office_flag(params.get("headings")),
-        "repeat_header": office_flag(params.get("repeat_header")),
-        "keep": keep,
-    }
+    return {"target": "subset.pdf"}
 
 
 def task_excel_prepare(job_dir: str, params: dict) -> dict:
@@ -1920,6 +2045,7 @@ WORKER_TASKS = {
     "unlock": task_unlock,
     "ocr": task_ocr,
     "pdf_to_excel": task_pdf_to_excel,
+    "pdf_subset": task_pdf_subset,
     "excel_prepare": task_excel_prepare,
     "ppt_handout": task_ppt_handout,
     "merge": task_merge,
@@ -2287,6 +2413,43 @@ class Job:
         os.replace(produced_path, target)
         return "converted.xlsx"
 
+    def libreoffice_pdf_to_pptx(self, src_name: str) -> None:
+        """Convert <job_dir>/<src_name> to <job_dir>/output.pptx.
+
+        The PDF goes in through Draw's PDF import filter and out through
+        Impress, which gives slides holding real text boxes and vector
+        shapes rather than a picture of each page. The page's own size is
+        carried across, so a widescreen PDF stays widescreen.
+        """
+        out_dir = os.path.join(self.dir, "lo-pptx")
+        os.makedirs(out_dir, exist_ok=True)
+        profile = os.path.join(LO_PROFILES_ROOT, f"slot-{self.slot}")
+        cmd = [
+            LIBREOFFICE_BIN,
+            f"-env:UserInstallation=file://{profile}",
+            "--headless",
+            "--norestore",
+            "--nolockcheck",
+            "--infilter=impress_pdf_import",
+            "--convert-to",
+            "pptx:Impress Office Open XML",
+            "--outdir",
+            out_dir,
+            os.path.join(self.dir, src_name),
+        ]
+        try:
+            run_child(cmd, self._remaining(), cwd=self.dir)
+        except ApiError:
+            remove_dir(profile)
+            raise
+
+        produced = [name for name in os.listdir(out_dir) if name.lower().endswith(".pptx")]
+        produced_path = os.path.join(out_dir, produced[0]) if produced else None
+        if not produced_path or os.path.getsize(produced_path) == 0:
+            remove_dir(profile)
+            raise ApiError(422, "convert_failed")
+        os.replace(produced_path, os.path.join(self.dir, "output.pptx"))
+
     def file_response(self, name: str, media_type: str, download_name: str, headers: dict | None = None) -> FileResponse:
         path = os.path.join(self.dir, name)
         if not os.path.exists(path) or os.path.getsize(path) == 0:
@@ -2649,6 +2812,8 @@ async def validation_error_handler(_request: Request, _exc: RequestValidationErr
 PDF_TYPE = "application/pdf"
 DOCX_TYPE = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 XLSX_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+PPTX_TYPE = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+CSV_TYPE = "text/csv"
 
 
 @app.post("/api/convert")
@@ -3042,11 +3207,68 @@ def ppt_to_pdf(
 
 
 @app.post("/api/pdf-to-excel")
-def pdf_to_excel(file: UploadFile = File(...), ocr: bool = Form(False)):
+def pdf_to_excel(
+    file: UploadFile = File(...),
+    ocr: bool = Form(False),
+    sheets: str = Form("one"),
+    output: str = Form("xlsx"),
+    header_row: str = Form(""),
+    pages: str = Form(""),
+    languages: str = Form(""),
+    preview: str = Form(""),
+):
     with Job("/api/pdf-to-excel", file) as job:
         job.start(".pdf")
-        job.run_worker("pdf_to_excel", {"ocr": bool(ocr), "max_pages_ocr": MAX_PAGES_PDF_TO_EXCEL_OCR})
+        result = job.run_worker(
+            "pdf_to_excel",
+            {
+                "ocr": bool(ocr),
+                "max_pages_ocr": MAX_PAGES_PDF_TO_EXCEL_OCR,
+                "sheets": sheets,
+                "output": output,
+                "header_row": header_row,
+                "pages": pages,
+                "languages": languages,
+                "preview": preview,
+            },
+        )
+
+        if result.get("preview") is not None:
+            # JSON, not a file. Nothing is streamed, so the job's directory
+            # is removed on the way out of the context manager.
+            return result["preview"]
+
+        name = result.get("file") or "output.xlsx"
+        if name == "output.csv":
+            return job.file_response("output.csv", CSV_TYPE, f"OptimaxPDF_Extracted_{job.base}.csv")
+        if name == "output.zip":
+            return job.file_response("output.zip", "application/zip", f"OptimaxPDF_Extracted_{job.base}.zip")
         return job.file_response("output.xlsx", XLSX_TYPE, f"OptimaxPDF_Extracted_{job.base}.xlsx")
+
+
+@app.post("/api/pdf-to-ppt")
+def pdf_to_ppt(file: UploadFile = File(...), pages: str = Form("")):
+    """PDF to PowerPoint, with text that can still be edited.
+
+    LibreOffice reads the PDF through Draw's import filter and writes
+    Impress's OOXML, which yields real text boxes and vector shapes rather
+    than a picture of each page, and keeps the page's own proportions.
+
+    The browser can also build a presentation from rendered page images with
+    nothing uploaded at all; that path lives entirely on the frontend and
+    never reaches this endpoint.
+    """
+    with Job("/api/pdf-to-ppt", file) as job:
+        job.start(".pdf")
+        source = "input.pdf"
+        if str(pages or "").strip():
+            subset = job.run_worker("pdf_subset", {"pages": pages})
+            if subset.get("target") == "subset.pdf":
+                source = "subset.pdf"
+        job.libreoffice_pdf_to_pptx(source)
+        return job.file_response(
+            "output.pptx", PPTX_TYPE, f"OptimaxPDF_PDFtoPPT_{job.base}.pptx"
+        )
 
 
 @app.post("/api/merge")
